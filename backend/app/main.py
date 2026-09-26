@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.db import init_db
-from app.routes import auth, credentials, profiles, bot_config
+from app.routes import auth, credentials, profiles, bot_config, dashboard
 
 app = FastAPI(title="Alpaca Paper Trading Bot", version="1.0.0")
 
@@ -19,6 +19,7 @@ app.include_router(auth.router)
 app.include_router(credentials.router)
 app.include_router(profiles.router)
 app.include_router(bot_config.router)
+app.include_router(dashboard.router)
 
 
 @app.on_event("startup")
