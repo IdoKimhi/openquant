@@ -8,12 +8,12 @@ settings = get_settings()
 fernet = Fernet(settings.secret_encryption_key.encode())
 
 
-def encrypt(plaintext: str) -> bytes:
-    return fernet.encrypt(plaintext.encode())
+def encrypt(plaintext: str) -> str:
+    return fernet.encrypt(plaintext.encode()).decode()
 
 
-def decrypt(ciphertext: bytes) -> str:
-    return fernet.decrypt(ciphertext).decode()
+def decrypt(ciphertext: str) -> str:
+    return fernet.decrypt(ciphertext.encode()).decode()
 
 
 def create_access_token(data: dict) -> str:
