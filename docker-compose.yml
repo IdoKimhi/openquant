@@ -1,0 +1,35 @@
+services:
+  frontend:
+    build: ./frontend
+    ports: ["80:80"]
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  backend:
+    build: ./backend
+    ports: ["8000:8000"]
+    volumes: [bot_data:/data]
+    env_file: .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    build: ./backend
+    command: python -m worker.main
+    volumes: [bot_data:/data]
+    env_file: .env
+    depends_on:
+      backend:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+volumes:
+  bot_data:
