@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional, List
 from datetime import datetime
 from app.models import StrategyType, OrderSide, OrderType, OrderStatus
@@ -42,12 +42,11 @@ class SMACrossoverParams(BaseModel):
     slow_period: int = Field(default=30, ge=2)
     position_size_pct: float = Field(default=0.10, gt=0, le=1)
 
-    @field_validator("fast_period")
-    @classmethod
-    def fast_lt_slow(cls, v, info):
-        if "slow_period" in info.data and v >= info.data["slow_period"]:
+    @model_validator(mode='after')
+    def validate_fast_lt_slow(self):
+        if self.fast_period >= self.slow_period:
             raise ValueError("fast_period must be less than slow_period")
-        return v
+        return self
 
 
 class RSIReversionParams(BaseModel):
@@ -56,12 +55,11 @@ class RSIReversionParams(BaseModel):
     overbought: int = Field(default=70, ge=1, le=100)
     position_size_pct: float = Field(default=0.10, gt=0, le=1)
 
-    @field_validator("oversold")
-    @classmethod
-    def oversold_lt_overbought(cls, v, info):
-        if "overbought" in info.data and v >= info.data["overbought"]:
+    @model_validator(mode='after')
+    def validate_oversold_lt_overbought(self):
+        if self.oversold >= self.overbought:
             raise ValueError("oversold must be less than overbought")
-        return v
+        return self
 
 
 class MomentumBreakoutParams(BaseModel):
