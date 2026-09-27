@@ -3,6 +3,7 @@
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy.orm import Session
+from zoneinfo import ZoneInfo
 import asyncio
 import logging
 import os
@@ -13,18 +14,28 @@ from datetime import datetime
 from app.db import get_engine, get_session_local
 from app.models import StrategyProfile, BotConfig, TradeLog, EquitySnapshot
 from app.bot.engine import run_strategy
-from app.bot.risk import RiskManager
+from app.bot.risk import RiskManager, compute_daily_loss_pct
 from app.alpaca_client import AlpacaClient
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+# Cron expressions are interpreted in this timezone. APScheduler otherwise
+# defaults to Etc/UTC, which would run a "9-16" schedule 05:00-12:00 ET.
+MARKET_TZ = ZoneInfo(settings.bot_timezone)
+
+
+def build_scheduler() -> BackgroundScheduler:
+    """Scheduler pinned to the market timezone."""
+    return BackgroundScheduler(timezone=MARKET_TZ)
+
+
 class BotWorker:
     """Main worker class that runs the trading bot on schedule"""
     
     def __init__(self):
-        self.scheduler = BackgroundScheduler()
+        self.scheduler = build_scheduler()
         self.db: Session = get_session_local()()
         self.running = False
         self._setup_signal_handlers()
@@ -58,7 +69,7 @@ class BotWorker:
             # Schedule the trading job
             cron_expr = bot_config.schedule_cron or settings.bot_schedule_cron
             try:
-                trigger = CronTrigger.from_crontab(cron_expr)
+                trigger = CronTrigger.from_crontab(cron_expr, timezone=MARKET_TZ)
                 self.scheduler.add_job(
                     self._run_trading_cycle,
                     trigger=trigger,
@@ -112,7 +123,7 @@ class BotWorker:
                 if not current_job:
                     # Need to add job
                     try:
-                        trigger = CronTrigger.from_crontab(cron_expr)
+                        trigger = CronTrigger.from_crontab(cron_expr, timezone=MARKET_TZ)
                         self.scheduler.add_job(
                             self._run_trading_cycle,
                             trigger=trigger,
@@ -128,7 +139,7 @@ class BotWorker:
                     # Check if cron expression changed
                     # We can't easily compare triggers, so just reschedule
                     try:
-                        trigger = CronTrigger.from_crontab(cron_expr)
+                        trigger = CronTrigger.from_crontab(cron_expr, timezone=MARKET_TZ)
                         self.scheduler.reschedule_job("trading_cycle", trigger=trigger)
                     except Exception as e:
                         logger.error(f"Failed to reschedule trading cycle: {e}")
@@ -189,11 +200,23 @@ class BotWorker:
                 logger.info("Market is closed, skipping cycle")
                 return
             
-            # Get account equity
-            equity = await alpaca.get_equity()
+            # Get account equity, plus the broker's own day P&L basis
+            account = await alpaca.get_account()
+            equity = float(account.equity)
             if equity <= 0:
                 logger.warning("Equity is zero or negative, skipping cycle")
                 return
+            
+            # Equity vs the previous close is the only trustworthy daily loss
+            # figure: TradeLog.pnl is never written, so the local sum is
+            # always zero and the loss limit could never trigger.
+            last_equity = float(account.last_equity) if account.last_equity else None
+            daily_loss_pct = compute_daily_loss_pct(equity=equity, last_equity=last_equity)
+            if daily_loss_pct > 0:
+                logger.warning(
+                    f"Account is down {daily_loss_pct:.2%} from the previous close "
+                    f"(equity {equity} vs last_equity {last_equity})"
+                )
             
             # Get current positions from Alpaca
             positions = await alpaca.get_positions()
@@ -222,7 +245,8 @@ class BotWorker:
                         equity=equity,
                         current_positions_count=current_positions_count,
                         current_position_symbols=current_position_symbols,
-                        risk_manager=risk_manager
+                        risk_manager=risk_manager,
+                        daily_loss_pct=daily_loss_pct
                     )
                 except Exception as e:
                     logger.error(f"Error processing signal for {signal.symbol}: {e}")
@@ -261,7 +285,8 @@ class BotWorker:
         equity: float,
         current_positions_count: int,
         current_position_symbols: set,
-        risk_manager: RiskManager
+        risk_manager: RiskManager,
+        daily_loss_pct: float = 0.0
     ):
         """Process a single trading signal with risk checks"""
         symbol = signal.symbol
@@ -286,7 +311,8 @@ class BotWorker:
             qty=qty,
             current_price=current_price,
             current_positions_count=current_positions_count,
-            side=side
+            side=side,
+            daily_loss_pct=daily_loss_pct
         )
         
         if not result.allowed:

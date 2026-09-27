@@ -54,10 +54,14 @@ All services share a SQLite database via a named Docker volume (`bot_data`).
 - **API**: RESTful endpoints with Pydantic validation
 
 ### Worker
-- **Scheduler**: APScheduler with cron trigger
+- **Scheduler**: APScheduler with cron trigger, pinned to `BOT_TIMEZONE` (Eastern by default)
 - **Pattern**: Background scheduler with dynamic job management
 - **Trading Cycle**: Runs on schedule, checks market hours, executes strategies
-- **Risk Management**: Position sizing, daily loss limits, concurrent position limits, kill-switch
+- **Async Model**: `BackgroundScheduler` runs jobs in a thread and does not await coroutines, so
+  `_run_trading_cycle` is a sync entry point wrapping one `asyncio.run()` around the whole cycle
+- **Risk Management**: Position sizing, daily loss limits, concurrent position limits, kill-switch.
+  The daily loss figure comes from the broker (`equity` vs `last_equity`), not from local
+  `TradeLog.pnl`, which is never written. Limits gate new buys but never block sells.
 
 ## Data Flow
 
@@ -128,7 +132,8 @@ All configured via `.env` file:
 - `APP_PASSWORD_HASH` - bcrypt hash of login password
 - `DATABASE_URL` - SQLite path (default: `sqlite:///data/bot.db`)
 - `JWT_SECRET` - JWT signing secret
-- `BOT_SCHEDULE_CRON` - APScheduler cron expression
+- `BOT_SCHEDULE_CRON` - APScheduler cron expression (evaluated in `BOT_TIMEZONE`)
+- `BOT_TIMEZONE` - IANA timezone for the cron expression (default: `America/New_York`)
 
 ### Startup
 ```bash

@@ -1,7 +1,6 @@
 from typing import List
-from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from app.bot.strategies.base import BaseStrategy, Signal
+from app.bot.strategies.base import BaseStrategy, Signal, bars_request
 
 
 class MomentumBreakoutStrategy(BaseStrategy):
@@ -17,9 +16,9 @@ class MomentumBreakoutStrategy(BaseStrategy):
         for symbol in symbols:
             try:
                 # Fetch daily bars for breakout calculation
-                req = StockBarsRequest(
-                    symbol_or_symbols=[symbol],
-                    timeframe=TimeFrame.Day,
+                req = bars_request(
+                    symbol,
+                    TimeFrame.Day,
                     limit=lookback + 1
                 )
                 bars = alpaca.data.get_stock_bars(req)

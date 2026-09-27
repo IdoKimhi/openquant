@@ -37,7 +37,7 @@ A Dockerized, self-hosted paper-trading application for Alpaca's paper trading A
 │   │   │   ├── engine.py        # Strategy execution
 │   │   │   ├── risk.py          # RiskManager: sizing, daily loss, concurrency, kill-switch
 │   │   │   └── strategies/
-│   │   │       ├── base.py      # BaseStrategy, Signal dataclass
+│   │   │       ├── base.py      # BaseStrategy, Signal, bars_request/lookback_start
 │   │   │       ├── __init__.py  # STRATEGY_REGISTRY
 │   │   │       ├── sma_crossover.py
 │   │   │       ├── rsi_reversion.py
@@ -48,7 +48,7 @@ A Dockerized, self-hosted paper-trading application for Alpaca's paper trading A
 │   │       ├── profiles.py      # prefix /profiles
 │   │       ├── bot_config.py    # prefix /bot
 │   │       └── dashboard.py     # prefix /dashboard
-│   ├── tests/                   # 11 files, 63 tests, all passing
+│   ├── tests/                   # 12 files, 96 tests, all passing
 │   └── worker/
 │       ├── main.py              # entrypoint (python -m worker.main)
 │       └── scheduler.py         # BotWorker: APScheduler jobs, trading cycle
@@ -70,13 +70,22 @@ All 19 planned tasks are implemented and verified:
 - ✅ Task 11: `bot/risk.py` + `test_risk.py`
 - ✅ Task 12: `worker/main.py` + `worker/scheduler.py`
 - ✅ Tasks 13-17: all 5 frontend pages
-- ✅ Task 18: full stack builds and runs; 63/63 tests pass
+- ✅ Task 18: full stack builds and runs; 96/96 tests pass
 - ✅ Task 19: `docs/ARCHITECTURE.md`, `.gitignore`, README
+- ✅ Trading-path audit: the bot had never executed. Four stacked bugs fixed and
+  regression-tested (missing `await`s, wrong `decrypt_value` import, wrong
+  `key_id` kwarg, and bar requests with no `start`). The daily loss limit and
+  kill-switch were permanently inert because they read a column nothing wrote.
+  The scheduler ran in UTC, so a market-hours cron fired 05:00-12:00 ET.
 
 There is no known failing functionality. Keep this file in sync with reality - it previously
 described finished work as "NOT STARTED", which wasted effort and hid real bugs.
 
-## Gotchas That Have Caused Bugs
+**The trading path was never exercised by the test suite.** `worker/scheduler.py` had no tests
+at all, and the strategy tests mocked the Alpaca client to always return bars. Do not add a
+feature to the trading path without a check that runs against real market data.
+
+## Gotchas That Have Caused Bugs (API and frontend)
 
 **1. Never put `/api` in a `TestClient` URL.**
 `/api` is an nginx concern. `nginx.conf` does `location /api/ { proxy_pass http://backend:8000/; }`,
@@ -126,13 +135,78 @@ docker compose exec backend sh -c 'cd /tmp && python -m pytest /app/tests -q'
 ```
 Note the image ships only `app/` and `worker/`, not `tests/`.
 
+When copying `app/`, `worker/` or `tests/` into a running container, `rm -rf` the destination
+first. `docker cp src dst` treats an existing `dst` directory as a parent and creates
+`dst/src_basename`, so a stale copy silently keeps running the old code.
+
+### Verifying against the real API, not just mocks
+Three separate bugs shipped here while every unit test passed, because the tests mocked the
+Alpaca client to always return happy-path data. When a bug is "the bot does nothing", unit
+tests cannot find it. Drive the real code against the real paper account with only the
+destructive call (`submit_order`) patched, and assert on what actually came back. See
+"Verifying the trading path" below.
+
+## Gotchas That Have Caused Bugs (runtime)
+
+**6. Alpaca's bars endpoint returns nothing unless you pass `start`.**
+A `StockBarsRequest` with only `limit` comes back `HTTP 200` with an empty payload - no error,
+no warning. Every strategy built its request that way, so all three hit their
+"insufficient bars" branch on every symbol on every run and the bot could never emit a signal.
+Always build requests through `bars_request()` in `strategies/base.py`, which derives a
+lookback wide enough to cover `limit` bars. A `start` alone is not enough - too narrow a window
+returns nothing either, which is why `lookback_start()` scales by timeframe.
+
+**7. `TradeLog.pnl` is never written, so anything reading it sees zero.**
+`RiskManager.check_daily_loss` summed `TradeLog.pnl`, but no code path in the app ever assigns
+it, so the daily loss limit and the kill-switch gate were permanently inert. The live figure
+now comes from the broker: `compute_daily_loss_pct(equity, last_equity)` on the Alpaca account
+(`last_equity` is the previous close, not `last_day_equity`). If you add P&L tracking, keep the
+broker number as the source of truth for the limit.
+
+**8. APScheduler defaults to `Etc/UTC`, so a market-hours cron fires at the wrong time.**
+`*/5 9-16 * * MON-FRI` under UTC is 05:00-12:00 ET, which silently skipped the entire afternoon.
+The scheduler is pinned via `build_scheduler()` / `MARKET_TZ` from the `bot_timezone` setting
+(default `America/New_York`). Cron expressions in this app are always Eastern, and market-hours
+labels in the UI assume that.
+
+**9. `BackgroundScheduler` does not await coroutine jobs.**
+`AlpacaClient` methods and `run_strategy` are `async`. APScheduler runs jobs in a plain worker
+thread, so a coroutine function registered as a job is never awaited - it just creates and
+discards a coroutine. `_run_trading_cycle` stays a sync entry point that calls
+`asyncio.run()` once around the whole cycle; do not make the job itself `async`. One loop per
+cycle matters, since repeatedly calling `asyncio.run()` per request would churn event loops
+underneath the SDK's HTTP client.
+
+## Verifying the trading path
+The trading cycle had never executed, so it had four independent bugs stacked on top of each
+other (all now fixed and regression-tested). To re-verify after touching it, run a dry run that
+patches only `submit_order` and lets everything else - real DB, real profile, real risk
+manager, real market data - run for real:
+
+```python
+with patch.object(AlpacaClient, 'submit_order', new=fake_submit), \
+     patch.object(AlpacaClient, 'get_clock') as gc, \
+     patch('worker.scheduler.run_strategy') as rs:
+    ...
+    worker._run_trading_cycle()
+```
+
+Two cautions: the cycle writes to the real `trade_logs` and `equity_snapshots` tables, so delete
+those rows afterwards. And `run_strategy` is where the market-data call happens, so patching it
+hides bug #6 - use `verify_live_bars`-style checks (real `alpaca.data.get_stock_bars`) when
+suspect the strategies return no signals.
+
 ## Key Technical Decisions
-1. **Single global cron schedule** (not per-profile) - `BOT_SCHEDULE_CRON` in `.env`
+1. **Single global cron schedule** (not per-profile) - `BOT_SCHEDULE_CRON` in `.env`, evaluated
+   in `BOT_TIMEZONE` (Eastern by default)
 2. **Separate worker container** - APScheduler polling the shared SQLite volume
 3. **Paper-only enforcement** - `AlpacaClient` ignores any base_url override
 4. **Encrypted credentials** - Fernet with key from `SECRET_ENCRYPTION_KEY`
 5. **No secrets in logs/source** - all via env vars
 6. **Single-password auth** - one bcrypt hash in `APP_PASSWORD_HASH`, JWT session after login
+7. **Risk limits are gates, not flatteners** - `validate_order` blocks new buys once the daily
+   loss limit is breached but deliberately always permits sells, so a breach can never trap a
+   position. Only `POST /bot/kill-switch` closes positions.
 
 ## API Surface
 | Prefix | Endpoints |

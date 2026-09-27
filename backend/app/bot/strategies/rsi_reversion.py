@@ -1,7 +1,6 @@
 from typing import List
-from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from app.bot.strategies.base import BaseStrategy, Signal
+from app.bot.strategies.base import BaseStrategy, Signal, bars_request
 
 
 class RSIReversionStrategy(BaseStrategy):
@@ -19,9 +18,9 @@ class RSIReversionStrategy(BaseStrategy):
         for symbol in symbols:
             try:
                 # Fetch bars for RSI calculation
-                req = StockBarsRequest(
-                    symbol_or_symbols=[symbol],
-                    timeframe=TimeFrame.Minute,
+                req = bars_request(
+                    symbol,
+                    TimeFrame.Minute,
                     limit=period + 5
                 )
                 bars = alpaca.data.get_stock_bars(req)
