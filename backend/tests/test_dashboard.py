@@ -29,7 +29,7 @@ def get_auth_token():
 
 def test_get_account_no_credentials():
     headers = {"Authorization": f"Bearer {get_auth_token()}"}
-    resp = client.get("/api/account", headers=headers)
+    resp = client.get("/dashboard/account", headers=headers)
     assert resp.status_code == 400
     assert "No credentials stored" in resp.json()["detail"]
 
@@ -55,6 +55,7 @@ def test_get_account_with_credentials():
         mock_client = AsyncMock()
         mock_account = MagicMock()
         mock_account.equity = "10000.00"
+        mock_account.portfolio_value = "10000.00"
         mock_account.cash = "5000.00"
         mock_account.buying_power = "5000.00"
         mock_account.status = "ACTIVE"
@@ -63,9 +64,10 @@ def test_get_account_with_credentials():
         mock_client.get_day_pl = AsyncMock(return_value=100.0)
         mock_client_class.return_value = mock_client
         
-        resp = client.get("/api/account", headers=headers)
+        resp = client.get("/dashboard/account", headers=headers)
         assert resp.status_code == 200
         assert resp.json()["equity"] == 10000.0
+        assert resp.json()["portfolio_value"] == 10000.0
         assert resp.json()["cash"] == 5000.0
         assert resp.json()["buying_power"] == 5000.0
         assert resp.json()["day_pl"] == 100.0
@@ -95,17 +97,23 @@ def test_get_positions():
         mock_position.symbol = "AAPL"
         mock_position.qty = "10"
         mock_position.avg_entry_price = "150.00"
+        mock_position.market_value = "1550.00"
+        mock_position.cost_basis = "1500.00"
         mock_position.current_price = "155.00"
         mock_position.unrealized_pl = "50.00"
+        mock_position.unrealized_plpc = "0.0333"
         mock_position.side.value = "long"
         mock_client.get_positions = AsyncMock(return_value=[mock_position])
         mock_client_class.return_value = mock_client
         
-        resp = client.get("/api/positions", headers=headers)
+        resp = client.get("/dashboard/positions", headers=headers)
         assert resp.status_code == 200
         assert len(resp.json()) == 1
         assert resp.json()[0]["symbol"] == "AAPL"
         assert resp.json()[0]["qty"] == 10.0
+        assert resp.json()[0]["market_value"] == 1550.0
+        assert resp.json()[0]["cost_basis"] == 1500.0
+        assert resp.json()[0]["unrealized_plpc"] == 0.0333
 
 
 def test_get_orders():
@@ -141,7 +149,7 @@ def test_get_orders():
         mock_client.get_orders = AsyncMock(return_value=[mock_order])
         mock_client_class.return_value = mock_client
         
-        resp = client.get("/api/orders", headers=headers)
+        resp = client.get("/dashboard/orders", headers=headers)
         assert resp.status_code == 200
         assert len(resp.json()) == 1
         assert resp.json()[0]["symbol"] == "AAPL"
@@ -177,7 +185,7 @@ def test_get_equity_curve():
         db.close()
     
     headers = {"Authorization": f"Bearer {get_auth_token()}"}
-    resp = client.get("/api/equity-curve", headers=headers)
+    resp = client.get("/dashboard/equity-curve", headers=headers)
     assert resp.status_code == 200
     assert len(resp.json()) >= 2
 
@@ -205,7 +213,7 @@ def test_get_logs():
         db.close()
     
     headers = {"Authorization": f"Bearer {get_auth_token()}"}
-    resp = client.get("/api/logs", headers=headers)
+    resp = client.get("/dashboard/logs", headers=headers)
     assert resp.status_code == 200
     assert len(resp.json()) >= 1
     assert resp.json()[0]["symbol"] == "AAPL"
@@ -237,6 +245,6 @@ def test_get_market_clock():
         mock_client.get_clock = AsyncMock(return_value=mock_clock)
         mock_client_class.return_value = mock_client
         
-        resp = client.get("/api/market-clock", headers=headers)
+        resp = client.get("/dashboard/market-clock", headers=headers)
         assert resp.status_code == 200
         assert resp.json()["is_open"] is True

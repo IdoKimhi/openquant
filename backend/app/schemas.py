@@ -124,6 +124,7 @@ class BotConfigUpdate(BaseModel):
 # Dashboard
 class AccountResponse(BaseModel):
     equity: float
+    portfolio_value: float
     cash: float
     buying_power: float
     day_pl: float
@@ -135,8 +136,11 @@ class PositionResponse(BaseModel):
     symbol: str
     qty: float
     avg_entry_price: float
+    market_value: float
+    cost_basis: float
     current_price: float
     unrealized_pl: float
+    unrealized_plpc: float
     side: str
 
 

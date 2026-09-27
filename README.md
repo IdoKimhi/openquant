@@ -62,7 +62,10 @@ A Dockerized, self-hosted paper-trading application for Alpaca's paper trading A
 alpaca-paper-bot/
 ├── docker-compose.yml
 ├── .env.example
+├── .env (gitignored)
 ├── README.md
+├── docs/
+│   └── ARCHITECTURE.md
 ├── backend/
 │   ├── Dockerfile
 │   ├── requirements.txt
@@ -80,15 +83,15 @@ alpaca-paper-bot/
 │   │   │   │   ├── sma_crossover.py
 │   │   │   │   ├── rsi_reversion.py
 │   │   │   │   └── momentum_breakout.py
-│   │   │   └── risk.py
-│   │   ├── routes/
-│   │   │   ├── auth.py
-│   │   │   ├── credentials.py
-│   │   │   ├── profiles.py
-│   │   │   ├── bot_config.py
-│   │   │   ├── dashboard.py
-│   │   │   └── market.py
-│   │   └── schemas.py
+│   │   │   ├── risk.py
+│   │   │   └── __init__.py
+│   │   └── routes/
+│   │       ├── auth.py
+│   │       ├── credentials.py
+│   │       ├── profiles.py
+│   │       ├── bot_config.py
+│   │       ├── dashboard.py
+│   │       └── market.py
 │   ├── tests/
 │   └── worker/
 │       ├── main.py
@@ -102,8 +105,7 @@ alpaca-paper-bot/
 │       ├── components/
 │       ├── hooks/
 │       └── api/
-└── docs/
-    └── ARCHITECTURE.md
+└── .gitignore
 ```
 
 ## API Endpoints
@@ -159,6 +161,37 @@ alpaca-paper-bot/
 - JWT-based authentication with bcrypt password hashing
 - Paper trading endpoint hardcoded - no live trading possible
 - No secrets in logs or source code
+
+## Testing
+
+```bash
+# Run backend tests
+cd /opt/alpaca-paper-bot/backend && pytest -v
+
+# Run frontend build
+cd /opt/alpaca-paper-bot/frontend && npm run build
+```
+
+## Development
+
+### Adding a New Strategy
+
+1. Create strategy class in `backend/app/bot/strategies/` extending `BaseStrategy`
+2. Register in `backend/app/bot/strategies/__init__.py`
+3. Add parameter validation in `backend/app/schemas.py`
+4. Add tests in `backend/tests/test_strategies.py`
+
+### Running Locally
+
+```bash
+# Backend
+cd backend
+python -m uvicorn app.main:app --reload
+
+# Frontend
+cd frontend
+npm run dev
+```
 
 ## License
 

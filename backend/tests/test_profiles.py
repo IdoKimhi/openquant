@@ -35,7 +35,7 @@ def test_create_profile():
         "risk_max_concurrent_positions": 5,
         "symbols": ["AAPL", "MSFT"]
     }
-    resp = client.post("/api/profiles", json=data, headers=headers)
+    resp = client.post("/profiles", json=data, headers=headers)
     assert resp.status_code == 200
     assert resp.json()["name"] == "Test SMA"
     assert resp.json()["strategy_type"] == "sma_crossover"
@@ -43,7 +43,7 @@ def test_create_profile():
 
 def test_list_profiles():
     headers = {"Authorization": f"Bearer {get_auth_token()}"}
-    resp = client.get("/api/profiles", headers=headers)
+    resp = client.get("/profiles", headers=headers)
     assert resp.status_code == 200
     assert isinstance(resp.json(), list)
 
@@ -60,10 +60,10 @@ def test_get_profile():
         "risk_max_concurrent_positions": 5,
         "symbols": ["AAPL"]
     }
-    create_resp = client.post("/api/profiles", json=data, headers=headers)
+    create_resp = client.post("/profiles", json=data, headers=headers)
     profile_id = create_resp.json()["id"]
     
-    resp = client.get(f"/api/profiles/{profile_id}", headers=headers)
+    resp = client.get(f"/profiles/{profile_id}", headers=headers)
     assert resp.status_code == 200
     assert resp.json()["id"] == profile_id
 
@@ -79,10 +79,10 @@ def test_update_profile():
         "risk_max_concurrent_positions": 5,
         "symbols": ["NVDA"]
     }
-    create_resp = client.post("/api/profiles", json=data, headers=headers)
+    create_resp = client.post("/profiles", json=data, headers=headers)
     profile_id = create_resp.json()["id"]
     
-    resp = client.patch(f"/api/profiles/{profile_id}", json={"name": "Updated Name"}, headers=headers)
+    resp = client.patch(f"/profiles/{profile_id}", json={"name": "Updated Name"}, headers=headers)
     assert resp.status_code == 200
     assert resp.json()["name"] == "Updated Name"
 
@@ -98,14 +98,14 @@ def test_delete_profile():
         "risk_max_concurrent_positions": 5,
         "symbols": ["AAPL"]
     }
-    create_resp = client.post("/api/profiles", json=data, headers=headers)
+    create_resp = client.post("/profiles", json=data, headers=headers)
     profile_id = create_resp.json()["id"]
     
-    resp = client.delete(f"/api/profiles/{profile_id}", headers=headers)
+    resp = client.delete(f"/profiles/{profile_id}", headers=headers)
     assert resp.status_code == 200
     
     # Verify deleted
-    get_resp = client.get(f"/api/profiles/{profile_id}", headers=headers)
+    get_resp = client.get(f"/profiles/{profile_id}", headers=headers)
     assert get_resp.status_code == 404
 
 
@@ -130,24 +130,24 @@ def test_activate_profile():
         "risk_max_concurrent_positions": 5,
         "symbols": ["MSFT"]
     }
-    resp1 = client.post("/api/profiles", json=data1, headers=headers)
-    resp2 = client.post("/api/profiles", json=data2, headers=headers)
+    resp1 = client.post("/profiles", json=data1, headers=headers)
+    resp2 = client.post("/profiles", json=data2, headers=headers)
     id1 = resp1.json()["id"]
     id2 = resp2.json()["id"]
     
     # Activate first
-    resp = client.post(f"/api/profiles/{id1}/activate", headers=headers)
+    resp = client.post(f"/profiles/{id1}/activate", headers=headers)
     assert resp.status_code == 200
     assert resp.json()["enabled"] is True
     
     # Verify second is disabled
-    get_resp = client.get(f"/api/profiles/{id2}", headers=headers)
+    get_resp = client.get(f"/profiles/{id2}", headers=headers)
     assert get_resp.json()["enabled"] is False
     
     # Activate second
-    resp = client.post(f"/api/profiles/{id2}/activate", headers=headers)
+    resp = client.post(f"/profiles/{id2}/activate", headers=headers)
     assert resp.json()["enabled"] is True
     
     # Verify first is now disabled
-    get_resp = client.get(f"/api/profiles/{id1}", headers=headers)
+    get_resp = client.get(f"/profiles/{id1}", headers=headers)
     assert get_resp.json()["enabled"] is False

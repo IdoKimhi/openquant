@@ -1,5 +1,5 @@
 from cryptography.fernet import Fernet
-import jwt
+from jose import jwt
 from datetime import datetime, timedelta, timezone
 import bcrypt
 from app.config import get_settings

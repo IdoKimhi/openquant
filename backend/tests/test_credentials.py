@@ -28,7 +28,7 @@ def get_auth_token():
 
 def test_store_credentials_encrypts():
     headers = {"Authorization": f"Bearer {get_auth_token()}"}
-    resp = client.post("/api/credentials", json={"key_id": "PKTEST", "secret_key": "sktest"}, headers=headers)
+    resp = client.post("/credentials", json={"key_id": "PKTEST", "secret_key": "sktest"}, headers=headers)
     assert resp.status_code == 200
     # Verify stored encrypted
     SessionLocal = get_session_local()
@@ -57,7 +57,7 @@ def test_credentials_status_no_keys():
         db.close()
     
     headers = {"Authorization": f"Bearer {get_auth_token()}"}
-    resp = client.get("/api/credentials/status", headers=headers)
+    resp = client.get("/credentials/status", headers=headers)
     assert resp.status_code == 200
     assert resp.json()["has_keys"] is False
 
@@ -87,7 +87,7 @@ def test_test_connection_calls_alpaca():
         mock_client.get_account = AsyncMock(return_value=mock_account)
         mock_client_class.return_value = mock_client
         
-        resp = client.post("/api/credentials/test", headers=headers)
+        resp = client.post("/credentials/test", headers=headers)
         assert resp.status_code == 200
         assert resp.json()["status"] == "connected"
         assert resp.json()["equity"] == "10000.00"

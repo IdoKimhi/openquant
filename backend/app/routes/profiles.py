@@ -5,7 +5,7 @@ from app.models import StrategyProfile
 from app.schemas import StrategyProfileCreate, StrategyProfileUpdate, StrategyProfileResponse
 from app.routes.auth import get_current_user
 
-router = APIRouter(prefix="/api/profiles", tags=["profiles"])
+router = APIRouter(prefix="/profiles", tags=["profiles"])
 
 
 @router.get("", response_model=list[StrategyProfileResponse])

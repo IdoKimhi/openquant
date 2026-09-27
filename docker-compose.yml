@@ -25,6 +25,11 @@ services:
     depends_on:
       backend:
         condition: service_started
+    # The backend image bakes in a HEALTHCHECK for the HTTP API on :8000.
+    # The worker runs no HTTP server, so that check would always fail and
+    # report a healthy scheduler as unhealthy.
+    healthcheck:
+      disable: true
     deploy:
       resources:
         limits:

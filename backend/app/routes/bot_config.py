@@ -5,7 +5,7 @@ from app.models import BotConfig, StrategyProfile
 from app.schemas import BotConfigResponse, BotConfigUpdate
 from app.routes.auth import get_current_user
 
-router = APIRouter(prefix="/api/bot", tags=["bot"])
+router = APIRouter(prefix="/bot", tags=["bot"])
 
 
 @router.get("/config", response_model=BotConfigResponse)

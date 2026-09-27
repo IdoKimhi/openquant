@@ -7,7 +7,7 @@ from app.security import encrypt, decrypt
 from app.alpaca_client import AlpacaClient
 from app.routes.auth import get_current_user
 
-router = APIRouter(prefix="/api/credentials", tags=["credentials"])
+router = APIRouter(prefix="/credentials", tags=["credentials"])
 
 
 @router.post("")

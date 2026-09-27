@@ -85,6 +85,7 @@ class TradeLog(Base):
     filled_qty = Column(Float, nullable=True)
     message = Column(Text, nullable=False)
     error_details = Column(Text, nullable=True)
+    pnl = Column(Float, nullable=True)  # Profit/Loss for filled trades
 
     profile = relationship("StrategyProfile")
 

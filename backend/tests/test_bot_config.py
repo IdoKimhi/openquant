@@ -26,7 +26,7 @@ def get_auth_token():
 
 def test_get_bot_config():
     headers = {"Authorization": f"Bearer {get_auth_token()}"}
-    resp = client.get("/api/bot/config", headers=headers)
+    resp = client.get("/bot/config", headers=headers)
     assert resp.status_code == 200
     assert "schedule_cron" in resp.json()
     assert "is_running" in resp.json()
@@ -34,7 +34,7 @@ def test_get_bot_config():
 
 def test_update_bot_config():
     headers = {"Authorization": f"Bearer {get_auth_token()}"}
-    resp = client.patch("/api/bot/config", json={"schedule_cron": "0 9 * * MON-FRI", "market_hours_only": False}, headers=headers)
+    resp = client.patch("/bot/config", json={"schedule_cron": "0 9 * * MON-FRI", "market_hours_only": False}, headers=headers)
     assert resp.status_code == 200
     assert resp.json()["schedule_cron"] == "0 9 * * MON-FRI"
     assert resp.json()["market_hours_only"] is False
@@ -90,18 +90,18 @@ def test_start_stop_bot():
         db.close()
     
     # Start
-    resp = client.post("/api/bot/start", headers=headers)
+    resp = client.post("/bot/start", headers=headers)
     print(f"Start response: {resp.status_code} - {resp.json()}")
     assert resp.status_code == 200
     assert resp.json()["is_running"] is True
     
     # Stop
-    resp = client.post("/api/bot/stop", headers=headers)
+    resp = client.post("/bot/stop", headers=headers)
     assert resp.status_code == 200
     assert resp.json()["is_running"] is False
     
     # Pause
-    resp = client.post("/api/bot/pause", headers=headers)
+    resp = client.post("/bot/pause", headers=headers)
     assert resp.status_code == 200
     assert resp.json()["is_running"] is False
 
@@ -123,5 +123,5 @@ def test_start_bot_requires_active_profile():
         db.close()
     
     # Try to start without active profile
-    resp = client.post("/api/bot/start", headers=headers)
+    resp = client.post("/bot/start", headers=headers)
     assert resp.status_code == 400

@@ -10,7 +10,7 @@ from app.alpaca_client import AlpacaClient
 from app.security import decrypt
 from app.routes.auth import get_current_user
 
-router = APIRouter(prefix="/api", tags=["dashboard"])
+router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 
 def get_alpaca_client(db: Session) -> AlpacaClient | None:
@@ -31,6 +31,7 @@ async def get_account(user=Depends(get_current_user), db: Session = Depends(get_
     
     return {
         "equity": float(account.equity),
+        "portfolio_value": float(account.portfolio_value),
         "cash": float(account.cash),
         "buying_power": float(account.buying_power),
         "day_pl": day_pl,
@@ -52,8 +53,11 @@ async def get_positions(user=Depends(get_current_user), db: Session = Depends(ge
             "symbol": pos.symbol,
             "qty": float(pos.qty),
             "avg_entry_price": float(pos.avg_entry_price),
+            "market_value": float(pos.market_value),
+            "cost_basis": float(pos.cost_basis),
             "current_price": float(pos.current_price),
             "unrealized_pl": float(pos.unrealized_pl),
+            "unrealized_plpc": float(pos.unrealized_plpc),
             "side": pos.side.value
         })
     return result

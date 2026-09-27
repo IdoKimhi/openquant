@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
-import jwt
+from jose import jwt, JWTError
 from app.config import get_settings
 from app.security import verify_token, verify_password, create_access_token
 from app.db import get_db
@@ -25,12 +25,12 @@ def verify(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         payload = verify_token(credentials.credentials)
         return {"valid": True, "user": payload["sub"]}
-    except jwt.PyJWTError:
+    except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         return verify_token(credentials.credentials)
-    except jwt.PyJWTError:
+    except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")

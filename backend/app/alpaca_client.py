@@ -1,7 +1,7 @@
 import httpx
 from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
@@ -62,6 +62,12 @@ class AlpacaClient:
     async def get_equity(self):
         account = await self.get_account()
         return float(account.equity)
+    
+    async def get_latest_quote(self, symbol: str):
+        """Get latest quote for a symbol"""
+        req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+        quotes = self.data.get_stock_latest_quote(req)
+        return quotes[symbol]
 
     async def get_bars(self, symbols: list[str], timeframe: TimeFrame, limit: int):
         req = StockBarsRequest(symbol_or_symbols=symbols, timeframe=timeframe, limit=limit)
