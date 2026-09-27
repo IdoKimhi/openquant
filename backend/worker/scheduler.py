@@ -12,7 +12,7 @@ import sys
 from datetime import datetime
 
 from app.db import get_engine, get_session_local
-from app.models import StrategyProfile, BotConfig, TradeLog, EquitySnapshot
+from app.models import StrategyProfile, BotConfig, TradeLog, EquitySnapshot, OrderStatus
 from app.bot.engine import run_strategy
 from app.bot.risk import RiskManager, compute_daily_loss_pct
 from app.alpaca_client import AlpacaClient
@@ -29,6 +29,44 @@ MARKET_TZ = ZoneInfo(settings.bot_timezone)
 def build_scheduler() -> BackgroundScheduler:
     """Scheduler pinned to the market timezone."""
     return BackgroundScheduler(timezone=MARKET_TZ)
+
+
+# Alpaca order statuses that mean "terminal, and it went through".
+_FILLED = {"filled"}
+# ...that mean "terminal, and it did not".
+_NOT_FILLED = {"canceled", "expired", "replaced", "done_for_day"}
+_REJECTED = {"rejected"}
+
+
+def local_order_status(alpaca_status) -> OrderStatus:
+    """Translate an Alpaca order status into this app's OrderStatus enum.
+
+    Alpaca has 18 order statuses and only three of them (filled, canceled,
+    rejected) overlap with ours. The rest - accepted, new, partially_filled,
+    pending_new, ... - describe an order that is still in flight, which is
+    exactly what our `submitted` value means. Note that Alpaca never sends
+    `submitted`; it is our own lifecycle label.
+
+    Everything unknown maps to `submitted` rather than raising: an unrecognised
+    broker status should not be able to take down a trading cycle. The stored
+    value has to be a real OrderStatus member because TradeLog.status is read
+    back through the ORM (see app/models.py).
+
+    Pass `order.status` straight in; both a bare string and an Alpaca enum
+    member are accepted. The activity log deliberately does not preserve the
+    broker's finer distinction between, say, `accepted` and `partially_filled` -
+    GET /dashboard/orders reports the live status, and `alpaca_order_id` on the
+    row is what links the two.
+    """
+    value = getattr(alpaca_status, "value", alpaca_status)
+
+    if value in _FILLED:
+        return OrderStatus.filled
+    if value in _REJECTED:
+        return OrderStatus.rejected
+    if value in _NOT_FILLED:
+        return OrderStatus.canceled
+    return OrderStatus.submitted
 
 
 class BotWorker:
@@ -342,7 +380,22 @@ class BotWorker:
                 limit_price=signal.limit_price
             )
             
-            # Log the trade
+            # Log the trade.
+            #
+            # Both fields below need converting, and getting either wrong
+            # corrupts a trade that has already been placed:
+            #
+            #   status         order.status is one of Alpaca's 18 values, none
+            #                  of which except filled/canceled/rejected exist in
+            #                  our OrderStatus enum. Writing it raw used to
+            #                  commit (SQLite has no CHECK here) and then poison
+            #                  the row, so the Activity tab could not load it.
+            #   alpaca_order_id  order.id is a uuid.UUID, which sqlite3 refuses
+            #                  to bind at all. That raised ProgrammingError on
+            #                  commit *after* the order was live at the broker,
+            #                  so the except branch below logged "Order failed"
+            #                  for an order that had really gone through, and
+            #                  the in-cycle position bookkeeping was skipped.
             trade_log = TradeLog(
                 profile_id=profile.id,
                 symbol=symbol,
@@ -350,8 +403,8 @@ class BotWorker:
                 qty=qty,
                 order_type=signal.order_type,
                 limit_price=signal.limit_price,
-                status=order.status,
-                alpaca_order_id=order.id,
+                status=local_order_status(order.status).value,
+                alpaca_order_id=str(order.id),
                 message=f"Order placed: {side} {qty} {symbol} @ {signal.order_type}"
             )
             self.db.add(trade_log)
@@ -377,7 +430,7 @@ class BotWorker:
                 qty=qty,
                 order_type=signal.order_type,
                 limit_price=signal.limit_price,
-                status="error",
+                status=OrderStatus.error.value,
                 message=f"Order failed: {str(e)}"
             )
             self.db.add(trade_log)

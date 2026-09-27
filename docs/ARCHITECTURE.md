@@ -120,6 +120,26 @@ All services share a SQLite database via a named Docker volume (`bot_data`).
 - `BotConfig.active_profile_id` → `StrategyProfile.id` (FK)
 - `TradeLog.profile_id` → `StrategyProfile.id` (FK, nullable)
 
+### Column typing at the broker boundary
+`trade_logs.status` and `alpaca_order_id` are free text (`String`), not enums, and the
+`/dashboard/orders` response model types its fields as `str`. This is deliberate.
+
+`alpaca.trading` returns 18 order statuses and SDK types, not JSON types: `order.id` is a
+`uuid.UUID`, `qty` a `Decimal`, and side/type/status are enum members. Two failure modes came
+from mapping that onto narrower types:
+
+- An `Enum` column accepted an unknown status, because SQLAlchemy 2.0 emits no CHECK
+  constraint by default. The row committed and then could not be loaded back, raising
+  `LookupError` and 500ing `/dashboard/logs` on the first real trade.
+- A `str` response field does not accept a `uuid.UUID` in Pydantic v2, so `/dashboard/orders`
+  500'd on every order regardless of status.
+
+So values are converted explicitly at the boundary: `local_order_status()` maps the broker's
+status to the app's own `OrderStatus` vocabulary before the row is written, and every
+`alpaca_client` return value is coerced in the route. `OrderStatus.submitted` is our own
+label for "in flight" - Alpaca never sends it. For a live order's real status, read
+`/dashboard/orders`; `alpaca_order_id` on the log row links the two.
+
 ## Deployment
 
 ### Requirements

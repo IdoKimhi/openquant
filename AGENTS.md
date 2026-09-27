@@ -48,7 +48,7 @@ A Dockerized, self-hosted paper-trading application for Alpaca's paper trading A
 │   │       ├── profiles.py      # prefix /profiles
 │   │       ├── bot_config.py    # prefix /bot
 │   │       └── dashboard.py     # prefix /dashboard
-│   ├── tests/                   # 12 files, 96 tests, all passing
+│   ├── tests/                   # 13 files, 139 tests, all passing
 │   └── worker/
 │       ├── main.py              # entrypoint (python -m worker.main)
 │       └── scheduler.py         # BotWorker: APScheduler jobs, trading cycle
@@ -70,20 +70,31 @@ All 19 planned tasks are implemented and verified:
 - ✅ Task 11: `bot/risk.py` + `test_risk.py`
 - ✅ Task 12: `worker/main.py` + `worker/scheduler.py`
 - ✅ Tasks 13-17: all 5 frontend pages
-- ✅ Task 18: full stack builds and runs; 96/96 tests pass
+- ✅ Task 18: full stack builds and runs; 139/139 tests pass
 - ✅ Task 19: `docs/ARCHITECTURE.md`, `.gitignore`, README
-- ✅ Trading-path audit: the bot had never executed. Four stacked bugs fixed and
-  regression-tested (missing `await`s, wrong `decrypt_value` import, wrong
-  `key_id` kwarg, and bar requests with no `start`). The daily loss limit and
-  kill-switch were permanently inert because they read a column nothing wrote.
-  The scheduler ran in UTC, so a market-hours cron fired 05:00-12:00 ET.
+- ✅ Trading-path audit: the bot had never executed. **Nine** independent bugs found and
+  regression-tested by actually running the cycle:
+  1-4. missing `await`s throughout, wrong `decrypt_value` import, wrong `key_id` kwarg, and
+  bar requests with no `start` (so every strategy saw zero bars and could never signal)
+  5. the daily loss limit and kill-switch were permanently inert - they read `TradeLog.pnl`,
+  which nothing ever writes
+  6. the scheduler ran in UTC, so a market-hours cron fired 05:00-12:00 ET
+  7. `TradeLog.status` typed as a 5-value enum while Alpaca sends 18. The write committed
+  (no CHECK in SQLite) and the row became unloadable, 500ing both `/dashboard/orders` and
+  `/dashboard/logs`
+  8. `OrderResponse.id` declared `str` while `order.id` is a `uuid.UUID` - `/dashboard/orders`
+  500'd on *every* order
+  9. `alpaca_order_id=order.id` passed a `uuid.UUID` to sqlite3, so the first real order was
+  placed at the broker and then logged as "Order failed"
 
 There is no known failing functionality. Keep this file in sync with reality - it previously
 described finished work as "NOT STARTED", which wasted effort and hid real bugs.
 
-**The trading path was never exercised by the test suite.** `worker/scheduler.py` had no tests
-at all, and the strategy tests mocked the Alpaca client to always return bars. Do not add a
-feature to the trading path without a check that runs against real market data.
+**Every one of those nine was invisible to the test suite.** `worker/scheduler.py` had no tests
+at all, and the strategy tests mocked the Alpaca client to always return bars. Bugs 7-9 were
+only found after building a test that drives `_process_signal` and reads the row back through
+the ORM. Do not add a feature to the trading path without a check that runs against real
+market data, and do not trust a mock that returns convenient types.
 
 ## Gotchas That Have Caused Bugs (API and frontend)
 
@@ -116,6 +127,16 @@ nuke a valid session.
 The backend image bakes in `HEALTHCHECK` curling `localhost:8000/health`. The worker serves no
 HTTP, so it fails forever and reports a healthy scheduler as `unhealthy`. `docker-compose.yml`
 disables it for the worker with `healthcheck: disable: true`.
+
+**5b. The broker returns SDK types, not JSON types. Coerce every one at the route.**
+`alpaca.trading` hands back `order.id` as a `uuid.UUID`, `qty` as a `Decimal`, and
+`side`/`order_type`/`status` as enum members. Pydantic v2 does **not** coerce these to
+`str`/`float` for you, and a `response_model` will reject them with
+`ResponseValidationError` -> HTTP 500. `/dashboard/orders` had `str()` on every field
+*except* `id`, so it 500'd on every order the moment one existed. The rule: anything
+coming out of `alpaca_client` that lands in a response dict gets converted explicitly.
+`TradeLog` writes are worse, because the row is already committed by the time anyone
+notices - see gotcha 10.
 
 ## Development Workflow
 - **TDD mandatory:** Write failing tests first, then implementation
@@ -177,24 +198,67 @@ discards a coroutine. `_run_trading_cycle` stays a sync entry point that calls
 cycle matters, since repeatedly calling `asyncio.run()` per request would churn event loops
 underneath the SDK's HTTP client.
 
+**10. Alpaca's order-status vocabulary is 18 values; ours is 5. Translate at the boundary.**
+Alpaca sends `new`, `accepted`, `partially_filled`, `pending_new`, `expired`, `done_for_day`...
+None of those except `filled`/`canceled`/`rejected` exist in `app.models.OrderStatus`, and
+`submitted` is our own label that Alpaca never sends. Writing `order.status` straight into
+`TradeLog.status` used to **commit successfully** - SQLAlchemy 2.0 emits no CHECK constraint by
+default, so SQLite happily stored `accepted` in a column the ORM could then not load back
+(`LookupError`). Two separate failures came out of that:
+- `GET /dashboard/orders` 500'd, because `OrderResponse.status` was typed as the local enum and
+  Pydantic rejected `accepted`.
+- `GET /dashboard/logs` 500'd on the first real trade, because materialising the `TradeLog` row
+  coerces the value into the enum.
+
+Fixes: `local_order_status()` in `worker/scheduler.py` maps broker -> local, `TradeLog.status`
+is a `String` column, and both response models use `str`. The column was never a real
+constraint, so dropping the enum costs nothing and needs no migration on SQLite.
+`test_order_status_vocabulary.py` pins all of it, including a check that the worker writes a
+row the ORM can read back - a test on the mapping function alone passes happily while the call
+site regresses, which is how the original bug survived.
+
+**11. Converting an order to a log row happens *after* the order is live.**
+`submit_order` is awaited first; only then is the `TradeLog` written. Any failure in that write
+is caught by the same `except` that wraps order placement, so a logging bug reads as a *trading*
+bug: the order really went to the broker, the app logs "Order failed", and the in-cycle position
+bookkeeping is skipped. This is exactly what `alpaca_order_id=order.id` did, because a
+`uuid.UUID` cannot be bound by sqlite3 (`ProgrammingError`) - see gotcha 5b. When a "failed"
+trade appears in the log, check the broker before believing it.
+
 ## Verifying the trading path
-The trading cycle had never executed, so it had four independent bugs stacked on top of each
-other (all now fixed and regression-tested). To re-verify after touching it, run a dry run that
-patches only `submit_order` and lets everything else - real DB, real profile, real risk
-manager, real market data - run for real:
+The trading cycle had never executed. Nine independent bugs have now been found by actually
+running it (four in the cycle itself, then the empty-bars bug, the inert kill-switch, the UTC
+schedule, and the order-status/UUID boundary bugs). All are regression-tested, but the lesson
+stands: unit tests that mock the Alpaca client cannot see any of this.
+
+To re-verify, drive the real code and let only `submit_order` be stubbed. **The stub must
+return the same types the real one does** - a `uuid.UUID` id and a real
+`alpaca.trading.enums.OrderStatus` member. A stub returning a plain string id and a bare
+status string is what hid bugs 10 and 11 for a whole release.
+
+Split it in two, because only one part can be forced:
 
 ```python
+# A: data path - nothing mocked at all. May legitimately produce 0 signals.
+sigs = asyncio.run(run_strategy(profile, alpaca))
+
+# B: order path - strategy stubbed to return one real Signal, rest real.
 with patch.object(AlpacaClient, 'submit_order', new=fake_submit), \
-     patch.object(AlpacaClient, 'get_clock') as gc, \
-     patch('worker.scheduler.run_strategy') as rs:
-    ...
+     patch.object(AlpacaClient, 'get_clock', new=_clock_sync), \
+     patch('worker.scheduler.run_strategy', new=injected_strategy):
     worker._run_trading_cycle()
 ```
 
+`get_clock` must be patched to report `is_open=True`, otherwise the cycle returns early on a
+weekend and you will conclude there is nothing to see. `fake_submit_order` and `_clock_sync` are
+`async`-shaped: the worker `await`s them, so return a completed future, not a coroutine.
+
 Two cautions: the cycle writes to the real `trade_logs` and `equity_snapshots` tables, so delete
-those rows afterwards. And `run_strategy` is where the market-data call happens, so patching it
-hides bug #6 - use `verify_live_bars`-style checks (real `alpaca.data.get_stock_bars`) when
-suspect the strategies return no signals.
+those rows afterwards. And patching `run_strategy` hides bug #6 - use real
+`alpaca.data.get_stock_bars` via `bars_request()` when you suspect the strategies return no
+signals. Finally, **read the row back through the ORM** (`row.status`, not raw SQL). A commit
+that succeeds can still have written a value the ORM cannot load, and only a real read catches
+that.
 
 ## Key Technical Decisions
 1. **Single global cron schedule** (not per-profile) - `BOT_SCHEDULE_CRON` in `.env`, evaluated

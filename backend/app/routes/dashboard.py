@@ -72,8 +72,13 @@ async def get_orders(user=Depends(get_current_user), db: Session = Depends(get_d
     orders = await client.get_orders()
     result = []
     for order in orders:
+        # Every field here is an SDK type, not a JSON type: order.id is a
+        # uuid.UUID, qty is a Decimal, and the enums are enum members. Pydantic
+        # v2 does not coerce those to str/float on its own, so each one has to
+        # be converted here or the whole endpoint 500s. `id` in particular was
+        # passed through raw while its neighbours were all wrapped.
         result.append({
-            "id": order.id,
+            "id": str(order.id),
             "symbol": order.symbol,
             "qty": float(order.qty),
             "side": order.side.value,

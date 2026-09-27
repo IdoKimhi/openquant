@@ -145,13 +145,23 @@ class PositionResponse(BaseModel):
 
 
 class OrderResponse(BaseModel):
+    """Mirrors a live Alpaca order.
+
+    `side`, `order_type` and `status` are plain `str`, deliberately not the
+    local OrderSide/OrderType/OrderStatus enums. Alpaca's vocabulary is far
+    larger than ours (18 order statuses, plus stop/stop_limit/trailing_stop
+    order types), and this endpoint reports whatever the broker holds. Typing
+    these as our enums made Pydantic reject a routine `accepted` order and
+    turned GET /dashboard/orders into a 500 the moment the bot traded.
+    """
+
     id: str
     symbol: str
     qty: float
-    side: OrderSide
-    order_type: OrderType
+    side: str
+    order_type: str
     limit_price: Optional[float] = None
-    status: OrderStatus
+    status: str
     filled_price: Optional[float] = None
     filled_qty: Optional[float] = None
     submitted_at: datetime
@@ -163,6 +173,15 @@ class EquityPoint(BaseModel):
 
 
 class TradeLogResponse(BaseModel):
+    """One row of the bot's own activity log.
+
+    `status` is a plain `str` because TradeLog.status is a free-text column.
+    The worker writes values from the local OrderStatus enum via
+    local_order_status(), but rows written before that mapping existed hold raw
+    Alpaca values ('accepted', 'new', ...). Typing this as the enum made the
+    Activity tab 500 on exactly those rows. See app/models.py TradeLog.status.
+    """
+
     id: int
     timestamp: datetime
     profile_id: Optional[int] = None
@@ -171,7 +190,7 @@ class TradeLogResponse(BaseModel):
     qty: float
     order_type: OrderType
     limit_price: Optional[float] = None
-    status: OrderStatus
+    status: str
     alpaca_order_id: Optional[str] = None
     filled_price: Optional[float] = None
     filled_qty: Optional[float] = None

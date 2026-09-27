@@ -79,7 +79,15 @@ class TradeLog(Base):
     qty = Column(Float, nullable=False)
     order_type = Column(SQLEnum(OrderType), default=OrderType.market)
     limit_price = Column(Float, nullable=True)
-    status = Column(SQLEnum(OrderStatus), default=OrderStatus.submitted)
+    # Free text, NOT SQLEnum(OrderStatus). This used to be SQLEnum, which
+    # looked safer but protected nothing: SQLAlchemy 2.0 emits no CHECK
+    # constraint by default, so the worker writing Alpaca's raw status
+    # ('accepted', 'partially_filled', ...) committed fine and the row then
+    # could not be loaded back - the ORM raises LookupError coercing an unknown
+    # value into the enum, which 500'd GET /dashboard/logs on the first trade.
+    # The worker now maps through local_order_status() before writing, and a
+    # String column means a stale row can never break the read path again.
+    status = Column(String, nullable=True, default=OrderStatus.submitted.value)
     alpaca_order_id = Column(String, nullable=True)
     filled_price = Column(Float, nullable=True)
     filled_qty = Column(Float, nullable=True)
