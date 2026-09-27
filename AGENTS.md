@@ -89,9 +89,14 @@ previously broke 20 tests. Test URLs must be the bare app path.
 it is a different mistake from #1, and the two bugs have opposite fixes.
 
 **3. Keep frontend interfaces in `api/*.ts` in sync with the Pydantic response models.**
-They are hand-written and drift silently. A field the backend does not return renders as
-`undefined` (currency formatters produce `"$NaN"`, they do not throw). Note the backend names
-the order-type field `order_type`, not `type`.
+They are hand-written and drift silently. A missing field usually renders as `undefined`
+(currency formatters produce `"$NaN"`, they do not throw). The dangerous case is a *date*:
+`format()` and `formatDistanceToNow()` from `date-fns` throw `RangeError: Invalid time value`
+on an invalid `Date`, which unmounts the entire page and shows a blank white screen with no
+error message. This is how the dashboard broke when `MarketClockResponse` omitted `timestamp`.
+`DashboardPage` now routes every date through `safeFormat`/`safeFormatDistance`, which return
+`'-'` instead of throwing. Apply the same pattern to any new date rendering. Note the backend
+names the order-type field `order_type`, not `type`.
 
 **4. `HTTPBearer` returns 403, not 401, when the header is missing entirely.**
 A 403 means "no Authorization header was sent". The axios interceptor in `api/client.ts` only

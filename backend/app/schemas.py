@@ -183,6 +183,7 @@ class TradeLogResponse(BaseModel):
 
 
 class MarketClockResponse(BaseModel):
+    timestamp: datetime
     is_open: bool
     next_open: Optional[datetime] = None
     next_close: Optional[datetime] = None

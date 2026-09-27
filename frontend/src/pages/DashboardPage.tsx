@@ -87,6 +87,21 @@ export function DashboardPage() {
   
   const getPnLColor = (value: number) => value >= 0 ? 'text-green-600' : 'text-red-600'
   const getPnLBg = (value: number) => value >= 0 ? 'bg-green-50' : 'bg-red-50'
+
+  // date-fns throws RangeError on an invalid Date, which unmounts the whole
+  // page and leaves a blank screen. Format defensively so a missing or
+  // malformed timestamp can never take the dashboard down.
+  const safeFormat = (value: string | null | undefined, pattern: string) => {
+    const date = value ? new Date(value) : null
+    if (!date || Number.isNaN(date.getTime())) return '-'
+    return format(date, pattern)
+  }
+
+  const safeFormatDistance = (value: string | null | undefined) => {
+    const date = value ? new Date(value) : null
+    if (!date || Number.isNaN(date.getTime())) return '-'
+    return formatDistanceToNow(date, { addSuffix: true })
+  }
   
   if (loading) {
     return (
@@ -136,11 +151,11 @@ export function DashboardPage() {
           </span>
           <span className="text-sm text-gray-500">
             {marketClock.is_open
-              ? `Closes at ${format(new Date(marketClock.next_close), 'h:mm a')}`
-              : `Opens at ${format(new Date(marketClock.next_open), 'h:mm a')}`}
+              ? `Closes at ${safeFormat(marketClock.next_close, 'h:mm a')}`
+              : `Opens at ${safeFormat(marketClock.next_open, 'h:mm a')}`}
           </span>
           <span className="text-xs text-gray-400 ml-auto">
-            Updated: {formatDistanceToNow(new Date(marketClock.timestamp), { addSuffix: true })}
+            Updated: {safeFormatDistance(marketClock.timestamp)}
           </span>
         </div>
       )}
@@ -380,7 +395,7 @@ export function DashboardPage() {
                       {orders.slice(0, 20).map(order => (
                         <tr key={order.id} className="hover:bg-gray-50">
                           <td className="py-3 text-sm text-gray-600">
-                            {format(new Date(order.submitted_at), 'MMM d, h:mm a')}
+                            {safeFormat(order.submitted_at, 'MMM d, h:mm a')}
                           </td>
                           <td className="py-3 font-medium text-gray-900">{order.symbol}</td>
                           <td className="py-3">
@@ -428,7 +443,7 @@ export function DashboardPage() {
                       <CartesianGrid strokeDasharray="3 3" stroke="#E5E7EB" />
                       <XAxis
                         dataKey="timestamp"
-                        tickFormatter={value => format(new Date(value), 'MMM d')}
+                        tickFormatter={value => safeFormat(value, 'MMM d')}
                         tick={{ fill: '#6B7280', fontSize: 12 }}
                         stroke="#E5E7EB"
                       />
@@ -439,7 +454,7 @@ export function DashboardPage() {
                       />
                       <Tooltip
                         formatter={(value: number) => [formatCurrency(value), 'Equity']}
-                        labelFormatter={value => format(new Date(value), 'MMM d, h:mm a')}
+                        labelFormatter={value => safeFormat(value, 'MMM d, h:mm a')}
                       />
                       <Line
                         type="monotone"
@@ -482,7 +497,7 @@ export function DashboardPage() {
                       {logs.map(log => (
                         <tr key={log.id} className="hover:bg-gray-50">
                           <td className="py-3 text-sm text-gray-600">
-                            {format(new Date(log.timestamp), 'MMM d, h:mm:ss a')}
+                            {safeFormat(log.timestamp, 'MMM d, h:mm:ss a')}
                           </td>
                           <td className="py-3 font-medium text-gray-900">{log.symbol}</td>
                           <td className="py-3">

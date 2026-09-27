@@ -123,6 +123,7 @@ async def get_market_clock(user=Depends(get_current_user), db: Session = Depends
     
     clock = await client.get_clock()
     return {
+        "timestamp": clock.timestamp,
         "is_open": clock.is_open,
         "next_open": clock.next_open,
         "next_close": clock.next_close

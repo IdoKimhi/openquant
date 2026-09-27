@@ -239,6 +239,7 @@ def test_get_market_clock():
     with patch('app.routes.dashboard.AlpacaClient') as mock_client_class:
         mock_client = AsyncMock()
         mock_clock = MagicMock()
+        mock_clock.timestamp = datetime(2026, 9, 27, 12, 0, 0)
         mock_clock.is_open = True
         mock_clock.next_open = None
         mock_clock.next_close = None
@@ -248,3 +249,7 @@ def test_get_market_clock():
         resp = client.get("/dashboard/market-clock", headers=headers)
         assert resp.status_code == 200
         assert resp.json()["is_open"] is True
+        # The dashboard renders `new Date(clock.timestamp)`; omitting it makes
+        # date-fns throw and unmounts the page as a blank screen.
+        assert resp.json()["timestamp"] is not None
+        assert resp.json()["timestamp"].startswith("2026-09-27")
