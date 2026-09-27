@@ -3,6 +3,7 @@
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy.orm import Session
+import asyncio
 import logging
 import os
 import signal
@@ -141,9 +142,21 @@ class BotWorker:
             logger.error(f"Error checking config changes: {e}")
     
     def _run_trading_cycle(self):
-        """Execute one trading cycle: run active strategy, apply risk checks, place orders"""
+        """Execute one trading cycle: run active strategy, apply risk checks, place orders
+
+        APScheduler's BackgroundScheduler runs jobs in a plain worker thread and
+        does not await coroutines, so this stays synchronous and drives the real
+        work through a single event loop in _run_trading_cycle_async. Calling
+        the async AlpacaClient methods without awaiting returns a coroutine
+        object, which fails on first attribute access.
+        """
         logger.info("Starting trading cycle")
-        
+        try:
+            asyncio.run(self._run_trading_cycle_async())
+        except Exception as e:
+            logger.error(f"Error in trading cycle: {e}", exc_info=True)
+
+    async def _run_trading_cycle_async(self):
         try:
             # Get active profile and bot config
             bot_config = self.db.query(BotConfig).first()
@@ -164,11 +177,6 @@ class BotWorker:
                 logger.warning("Active profile not found or disabled, skipping cycle")
                 return
             
-            # Check market hours if configured
-            if bot_config.market_hours_only:
-                # We'll let Alpaca client handle market hours check
-                pass
-            
             # Get Alpaca client with credentials
             alpaca = self._get_alpaca_client()
             if not alpaca:
@@ -176,27 +184,27 @@ class BotWorker:
                 return
             
             # Check market clock
-            clock = alpaca.get_clock()
+            clock = await alpaca.get_clock()
             if not clock.is_open:
                 logger.info("Market is closed, skipping cycle")
                 return
             
             # Get account equity
-            equity = alpaca.get_equity()
+            equity = await alpaca.get_equity()
             if equity <= 0:
                 logger.warning("Equity is zero or negative, skipping cycle")
                 return
             
             # Get current positions from Alpaca
-            positions = alpaca.get_positions()
+            positions = await alpaca.get_positions()
             current_position_symbols = {p.symbol for p in positions}
             current_positions_count = len(positions)
             
             # Run strategy to get signals
-            signals = run_strategy(profile, alpaca)
+            signals = await run_strategy(profile, alpaca)
             if not signals:
                 logger.info("No signals generated")
-                self._record_equity_snapshot(equity)
+                await self._record_equity_snapshot(equity)
                 return
             
             logger.info(f"Generated {len(signals)} signals")
@@ -207,7 +215,7 @@ class BotWorker:
             # Process each signal
             for signal in signals:
                 try:
-                    self._process_signal(
+                    await self._process_signal(
                         signal=signal,
                         profile=profile,
                         alpaca=alpaca,
@@ -221,7 +229,7 @@ class BotWorker:
                     continue
             
             # Record equity snapshot
-            self._record_equity_snapshot(equity)
+            await self._record_equity_snapshot(equity)
             
             logger.info("Trading cycle completed")
             
@@ -231,21 +239,21 @@ class BotWorker:
     def _get_alpaca_client(self) -> AlpacaClient | None:
         """Create Alpaca client with stored credentials"""
         from app.models import ApiCredentials
-        from app.security import decrypt_value
+        from app.security import decrypt
         
         creds = self.db.query(ApiCredentials).first()
         if not creds:
             return None
         
         try:
-            key_id = decrypt_value(creds.key_id_encrypted)
-            secret_key = decrypt_value(creds.secret_key_encrypted)
-            return AlpacaClient(key_id=key_id, secret_key=secret_key)
+            key_id = decrypt(creds.key_id_encrypted)
+            secret_key = decrypt(creds.secret_key_encrypted)
+            return AlpacaClient(api_key=key_id, secret_key=secret_key)
         except Exception as e:
             logger.error(f"Failed to decrypt credentials: {e}")
             return None
     
-    def _process_signal(
+    async def _process_signal(
         self,
         signal,
         profile: StrategyProfile,
@@ -265,7 +273,7 @@ class BotWorker:
         if current_price <= 0:
             # Try to get latest price from Alpaca
             try:
-                quote = alpaca.get_latest_quote(symbol)
+                quote = await alpaca.get_latest_quote(symbol)
                 current_price = quote.ask_price if side == "buy" else quote.bid_price
             except Exception:
                 logger.warning(f"Could not get current price for {signal.symbol}")
@@ -300,7 +308,7 @@ class BotWorker:
         
         # Place order
         try:
-            order = alpaca.submit_order(
+            order = await alpaca.submit_order(
                 symbol=symbol,
                 qty=qty,
                 side=side,
@@ -349,17 +357,17 @@ class BotWorker:
             self.db.add(trade_log)
             self.db.commit()
     
-    def _record_equity_snapshot(self, equity: float):
+    async def _record_equity_snapshot(self, equity: float):
         """Record equity snapshot for equity curve"""
         try:
             alpaca = self._get_alpaca_client()
             if alpaca:
-                account = alpaca.get_account()
+                account = await alpaca.get_account()
                 snapshot = EquitySnapshot(
                     equity=equity,
-                    cash=account.cash,
-                    buying_power=account.buying_power,
-                    day_pl=float(account.daytrade_count) if hasattr(account, 'daytrade_count') else 0.0,
+                    cash=float(account.cash),
+                    buying_power=float(account.buying_power),
+                    day_pl=float(getattr(account, 'daytrade_count', 0) or 0),
                     total_pl=0.0  # Would need to calculate from positions
                 )
                 self.db.add(snapshot)

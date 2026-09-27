@@ -191,35 +191,35 @@ export function SchedulePage() {
           <div>
             <label className="label">Quick Presets</label>
             <div className="grid grid-cols-1 gap-2">
-              {cronPresets.map(preset => (
-                <label
-                  key={preset.value}
-                  className={`relative cursor-pointer p-3 border rounded-lg transition-colors ${
-                    form.watch('schedule_cron') === preset.value
-                      ? 'border-blue-500 bg-blue-50'
-                      : 'border-gray-200 hover:border-gray-300'
-                  }`}
-                >
-                  <input
-                    type="radio"
-                    value={preset.value}
-                    {...form.register('schedule_cron')}
-                    className="sr-only"
-                  />
-                  <div className="flex items-center">
-                    <div className={`h-4 w-4 border rounded ${
-                      form.watch('schedule_cron') === preset.value
-                        ? 'border-blue-500 bg-blue-500'
-                        : 'border-gray-300'
-                    } relative`}>
-                      {form.watch('schedule_cron') === preset.value && (
-                        <Check className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-3 w-3 text-white" />
-                      )}
+              {cronPresets.map(preset => {
+                const selected = form.watch('schedule_cron') === preset.value
+                return (
+                  <button
+                    key={preset.value}
+                    type="button"
+                    onClick={() => form.setValue('schedule_cron', preset.value, { shouldDirty: true, shouldValidate: true })}
+                    aria-pressed={selected}
+                    className={`relative cursor-pointer p-3 border rounded-lg transition-colors text-left ${
+                      selected
+                        ? 'border-blue-500 bg-blue-50'
+                        : 'border-gray-200 hover:border-gray-300'
+                    }`}
+                  >
+                    <div className="flex items-center">
+                      <div className={`h-4 w-4 border rounded ${
+                        selected
+                          ? 'border-blue-500 bg-blue-500'
+                          : 'border-gray-300'
+                      } relative`}>
+                        {selected && (
+                          <Check className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-3 w-3 text-white" />
+                        )}
+                      </div>
+                      <span className="ml-3 text-sm text-gray-700">{preset.label}</span>
                     </div>
-                    <span className="ml-3 text-sm text-gray-700">{preset.label}</span>
-                  </div>
-                </label>
-              ))}
+                  </button>
+                )
+              })}
             </div>
             
             {/* Custom Cron */}

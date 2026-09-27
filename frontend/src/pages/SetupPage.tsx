@@ -31,7 +31,7 @@ export function SetupPage() {
   const checkStatus = async () => {
     try {
       const response = await credentialsApi.getStatus()
-      setHasCredentials(response.data.has_credentials)
+      setHasCredentials(response.data.has_keys)
     } catch (error) {
       console.error('Failed to check credentials status:', error)
     }
@@ -43,13 +43,14 @@ export function SetupPage() {
     try {
       const response = await credentialsApi.test()
       const result: TestConnectionResult = response.data
-      if (result.success) {
-        setStatus('success')
-        setStatusMessage(`Connected successfully! Account: ${result.account?.id} | Equity: $${Number(result.account?.equity).toLocaleString()}`)
-      } else {
-        setStatus('error')
-        setStatusMessage(result.message)
-      }
+      // The endpoint signals failure with HTTP 400 (handled below), so a 200
+      // means the keys authenticated.
+      setStatus('success')
+      setStatusMessage(
+        `Connected to Alpaca! Status: ${result.account_status ?? 'unknown'} | ` +
+        `Equity: $${Number(result.equity).toLocaleString()} | ` +
+        `Buying power: $${Number(result.buying_power).toLocaleString()}`
+      )
     } catch (error: any) {
       setStatus('error')
       setStatusMessage(error.response?.data?.detail || 'Connection test failed')
