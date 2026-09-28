@@ -82,12 +82,16 @@ and ignores any override. This is a research and education tool.
 This is enforced in `backend/app/alpaca_client.py`, not by configuration:
 
 ```python
-# Any base_url passed in is ignored. The paper endpoint is not negotiable.
+def __init__(self, api_key: str, secret_key: str, base_url: str = None):
+    # HARDCODED: paper-only, ignore any passed base_url
+    self.base_url = "https://paper-api.alpaca.markets"
+    self.trading = TradingClient(api_key, secret_key, paper=True, url_override=self.base_url)
 ```
 
-There is no environment variable, request field, or admin toggle that can
-point this at live trading. If you fork this to trade real money, you are
-modifying the code, and that is the only way it happens.
+The `base_url` argument is accepted and then discarded, and `paper=True` is
+passed to the SDK as well. There is no environment variable, request field, or
+admin toggle that can reach live trading. If you fork this to trade real money,
+you are editing the code — and that is the only way it happens.
 
 ---
 
