@@ -189,19 +189,45 @@ class TestRiskManager:
         # 10% of 100000 = 10000, / 150 = 66 shares
         assert qty == 66
 
-    def test_calculate_position_size_minimum_one(self, risk_manager, active_profile):
-        """Test position size is at least 1 share when equity allows"""
-        equity = 1000.0  # Small equity
-        current_price = 150.0
-        
+    def test_calculate_position_size_will_not_overshoot_the_cap(self, risk_manager, active_profile):
+        """A budget too small for a whole share returns 0, not 1.
+
+        This used to be `return max(1, qty)`, which guarantees a trade by
+        buying a share the budget cannot pay for: 10% of $1000 is $100, a
+        $150 stock is one share, and the resulting order is 15% of equity
+        against a 10% cap. The cap is a limit, not a target, so rounding *up*
+        to it is a silent risk-limit breach - worse than not trading, because
+        nothing reports it.
+
+        The real answer to a too-small budget is fractional sizing
+        (`allow_fractional_shares`), which is asserted below; rounding up was
+        only ever a way of pretending the problem did not exist.
+        """
+        equity = 1000.0  # 10% = $100
+        current_price = 150.0  # one share is $150
+
         qty = risk_manager.calculate_position_size(
             profile=active_profile,
             equity=equity,
             current_price=current_price
         )
-        
-        # 10% of 1000 = 100, / 150 = 0, but should return at least 1
-        assert qty == 1
+
+        assert qty == 0
+
+    def test_fractional_sizing_uses_a_budget_a_whole_share_would_not(self, risk_manager, active_profile):
+        """With fractional shares on, the same budget does deploy."""
+        equity = 1000.0
+        current_price = 150.0
+        active_profile.allow_fractional_shares = True
+
+        qty = risk_manager.calculate_position_size(
+            profile=active_profile,
+            equity=equity,
+            current_price=current_price
+        )
+
+        # $100 / $150 = 0.6666 -> 0.66 shares, i.e. $99 of the $100 budget.
+        assert qty == pytest.approx(0.66, abs=1e-9)
 
     def test_should_trigger_kill_switch(self, risk_manager, active_profile, mock_db):
         """Test kill switch triggers when daily loss exceeds threshold"""

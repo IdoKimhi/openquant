@@ -7,6 +7,7 @@ from app.schemas import (
     TradeLogResponse, MarketClockResponse
 )
 from app.alpaca_client import AlpacaClient
+from app.bot.market_hours import MARKET_TZ, market_session_state, trading_allowed
 from app.security import decrypt
 from app.authz import SCOPE_READ, require_scope
 
@@ -154,11 +155,23 @@ async def get_market_clock(principal=Depends(require_scope(SCOPE_READ)), db: Ses
     client = get_alpaca_client(db)
     if not client:
         raise HTTPException(400, "No credentials stored")
-    
+
     clock = await client.get_clock()
+
+    # `is_open` alone cannot answer "may the bot trade right now" - it is true
+    # from 04:00 to 20:00 ET. The session subdivision comes from the same module
+    # the worker gates on, and the flag from the same row the worker reads, so
+    # what the dashboard says and what the bot does cannot disagree.
+    config = db.query(BotConfig).first()
+    market_hours_only = bool(config.market_hours_only) if config else True
+    session_state = market_session_state(clock)
+
     return {
         "timestamp": clock.timestamp,
         "is_open": clock.is_open,
         "next_open": clock.next_open,
-        "next_close": clock.next_close
+        "next_close": clock.next_close,
+        "session_state": session_state,
+        "timezone": MARKET_TZ.key,
+        "trading_allowed": trading_allowed(session_state, market_hours_only),
     }

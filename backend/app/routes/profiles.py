@@ -55,6 +55,21 @@ def update_profile(
     if not profile:
         raise HTTPException(404, "Profile not found")
 
+    # The position-cap contradiction check, over the merged result. Done before
+    # any setattr so a rejected edit leaves the profile exactly as it was.
+    # See StrategyProfileUpdate.check_position_caps.
+    #
+    # Raised as an explicit 422 rather than letting the ValueError propagate:
+    # on create, Pydantic runs the check inside model validation and turns it
+    # into a 422 for free, but here the check is called by hand on already-
+    # validated input, so an uncaught ValueError becomes a 500. Same rejection,
+    # different status - and a 500 for a user-input problem is the kind of
+    # thing that gets logged as a server fault and never fixed.
+    try:
+        data.check_position_caps(profile)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
     for field, value in data.model_dump(exclude_unset=True).items():
         setattr(profile, field, value)
 

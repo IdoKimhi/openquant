@@ -1,16 +1,36 @@
 from typing import List
 from alpaca.data.timeframe import TimeFrame
 from app.bot.strategies.base import BaseStrategy, Signal, bars_request
+from app.bot.risk import size_qty
 
 
 class SMACrossoverStrategy(BaseStrategy):
-    async def generate_signals(self, symbols: List[str], params: dict, alpaca) -> List[Signal]:
+    async def generate_signals(
+        self,
+        symbols: List[str],
+        params: dict,
+        alpaca,
+        investable_equity: float | None = None,
+    ) -> List[Signal]:
         fast_period = params.get("fast_period", 10)
         slow_period = params.get("slow_period", 30)
         position_size_pct = params.get("position_size_pct", 0.10)
         
-        # Get account equity for position sizing
-        equity = await alpaca.get_equity()
+        # The sizing base, and how to round it.
+        #
+        # `investable_equity` arrives already scaled by the operator's
+        # capital allocation (issue #6). All three strategies used to call
+        # `alpaca.get_equity()` for themselves, which meant the setting
+        # would have to be honoured in each file independently - and the
+        # fallback is kept so a direct caller and the existing tests still
+        # size against the whole account.
+        equity = investable_equity if investable_equity is not None else await alpaca.get_equity()
+        # Fractional sizing is opt-in per profile (issue #2): truncating to
+        # whole shares strands up to one share per position, which on a
+        # $700 name is $700 a signal. size_qty owns the rounding so the
+        # risk limits and the strategies cannot disagree about a size.
+        allow_fractional = bool(params.get("allow_fractional_shares", False))
+        budget = equity * position_size_pct
         
         signals = []
         
@@ -40,7 +60,7 @@ class SMACrossoverStrategy(BaseStrategy):
                 # Check for crossover
                 if prev_fast_sma <= prev_slow_sma and fast_sma > slow_sma:
                     # Golden cross - BUY
-                    qty = int((equity * position_size_pct) / current_price)
+                    qty = size_qty(budget, current_price, allow_fractional)
                     if qty > 0:
                         signals.append(Signal(
                             symbol=symbol,
@@ -50,7 +70,7 @@ class SMACrossoverStrategy(BaseStrategy):
                         ))
                 elif prev_fast_sma >= prev_slow_sma and fast_sma < slow_sma:
                     # Death cross - SELL (flatten position)
-                    qty = int((equity * position_size_pct) / current_price)
+                    qty = size_qty(budget, current_price, allow_fractional)
                     if qty > 0:
                         signals.append(Signal(
                             symbol=symbol,

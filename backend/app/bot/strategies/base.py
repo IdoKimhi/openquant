@@ -80,5 +80,20 @@ class BaseStrategy(ABC):
         self.params = params
 
     @abstractmethod
-    async def generate_signals(self, symbols: List[str], params: dict, alpaca: TradingClient) -> List[Signal]:
-        pass
+    async def generate_signals(
+        self,
+        symbols: List[str],
+        params: dict,
+        alpaca: TradingClient,
+        investable_equity: float | None = None,
+    ) -> List[Signal]:
+        """Signals sized against `investable_equity`.
+
+        `investable_equity` is the worker's capital allocation applied to
+        account equity (issue #6). It is a parameter rather than something each
+        strategy fetches for itself because all three used to call
+        `alpaca.get_equity()` independently, which made the allocation setting
+        impossible to honour in one strategy and not another. Left as None, a
+        strategy falls back to the account's full equity, so the existing tests
+        and any direct caller keep working.
+        """

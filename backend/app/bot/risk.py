@@ -15,6 +15,54 @@ class RiskCheckResult:
     reason: Optional[str] = None
 
 
+def allocation_pct(value) -> float:
+    """The capital allocation in force, clamped, with NULL meaning "all of it".
+
+    This database is a file on a volume, upgraded by `ensure_schema` in
+    app/db.py, so a row written before `capital_allocation_pct` existed has
+    NULL there. That is not a hypothetical: it is what every row in a
+    pre-upgrade deployment holds, and `equity * None` raises TypeError inside
+    the trading cycle - a bot that stops trading with a traceback in the log.
+
+    Clamped rather than trusted, because this value decides how much real
+    capital gets committed.
+    """
+    if value is None:
+        return 1.0
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def size_qty(value: float, price: float, allow_fractional: bool = False) -> float:
+    """How many shares `value` buys at `price`.
+
+    The one place position sizing happens for every strategy. All three used to
+    inline `int((equity * pct) / price)`, which truncates toward zero and so
+    throws away up to a full share per position - on a $700 stock that is $700
+    per signal, and it is a large part of the "only 70% deployed" complaint
+    (issue #2).
+
+    Whole shares by default, matching what the broker accepts for every order
+    type. Alpaca supports fractional quantities for market orders only, so
+    fractional sizing is opt-in and the caller has to know that; see
+    AlpacaClient.submit_order, which refuses a fractional limit order rather
+    than letting the broker reject it.
+
+    Returns 0.0 when the amount cannot buy the smallest permitted increment,
+    which callers already treat as "no signal" - rounding *up* to 1 share would
+    breach a 15% cap on a small account.
+    """
+    if price is None or price <= 0:
+        return 0.0
+    if not allow_fractional:
+        return float(int(value / price))
+    # Two decimals, which is what Alpaca accepts for a fractional stock
+    # quantity. Truncated, never rounded up: the cap is a ceiling.
+    return float(int(value / price * 100) / 100)
+
+
 def compute_daily_loss_pct(equity: float, last_equity: Optional[float]) -> float:
     """Today's loss as a fraction of the previous close's equity.
 
@@ -31,24 +79,43 @@ def compute_daily_loss_pct(equity: float, last_equity: Optional[float]) -> float
 
 class RiskManager:
     """Manages risk controls for trading bot"""
-    
+
     def __init__(self, db: Session):
         self.db = db
-    
+
+    @staticmethod
+    def investable_equity(equity: float, capital_allocation_pct) -> float:
+        """The equity position sizing and every risk limit are measured against.
+
+        Issue #6, the "money to invest" control. A 0.8 allocation means 80% of
+        the account may be committed and 20% is held back.
+
+        One base for everything, deliberately. Applying the allocation only to
+        the strategies would shrink the positions while leaving the limits
+        measured against the whole account, so a 15%-of-equity position cap
+        would become 18.75% of what the operator asked to be investable - the
+        cash reserve would exist and the risk envelope would not respect it.
+        """
+        return max(0.0, float(equity) * allocation_pct(capital_allocation_pct))
+
     def calculate_position_size(
         self,
         profile: StrategyProfile,
         equity: float,
         current_price: float
-    ) -> int:
+    ) -> float:
         """
-        Calculate position size based on equity and position_size_pct parameter.
-        Returns at least 1 share if equity allows any position.
+        Calculate position size from investable equity and position_size_pct.
+
+        Delegates to the shared sizing helper so this and the strategies cannot
+        disagree about what a position is worth.
         """
-        position_size_pct = profile.parameters.get("position_size_pct", 0.10)
-        max_position_value = equity * position_size_pct
-        qty = int(max_position_value / current_price)
-        return max(1, qty)
+        position_size_pct = (profile.parameters or {}).get("position_size_pct", 0.10)
+        return size_qty(
+            equity * float(position_size_pct),
+            current_price,
+            allow_fractional=bool(profile.allow_fractional_shares),
+        )
     
     def check_position_size(
         self,

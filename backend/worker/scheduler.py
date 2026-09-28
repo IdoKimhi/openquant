@@ -9,25 +9,42 @@ import logging
 import os
 import signal
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from app.db import get_engine, get_session_local
 from app.models import StrategyProfile, BotConfig, TradeLog, EquitySnapshot, OrderStatus
 from app.bot.engine import run_strategy
-from app.bot.risk import RiskManager, compute_daily_loss_pct
+from app.bot.market_hours import (
+    MARKET_TZ,
+    market_session_state,
+    skip_reason,
+    trading_allowed,
+)
+from app.bot.risk import RiskManager, allocation_pct, compute_daily_loss_pct, size_qty
 from app.alpaca_client import AlpacaClient
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# Cron expressions are interpreted in this timezone. APScheduler otherwise
-# defaults to Etc/UTC, which would run a "9-16" schedule 05:00-12:00 ET.
-MARKET_TZ = ZoneInfo(settings.bot_timezone)
+# How far back the fill reconciler looks for unresolved orders. Alpaca keeps a
+# bounded order history, so anything older than this is a guaranteed 404 on
+# every pass; searching it anyway would mean the sweep grows without limit and
+# its log fills with errors that are really just "expired", burying the ones
+# that matter. A DAY order that has not filled within a trading day is gone.
+RECONCILE_MAX_AGE_HOURS = 48
 
 
 def build_scheduler() -> BackgroundScheduler:
-    """Scheduler pinned to the market timezone."""
+    """Scheduler pinned to the market timezone.
+
+    `MARKET_TZ` is defined once, in app/bot/market_hours.py, and imported here
+    rather than rebuilt from settings. The schedule's zone and the zone the
+    trading-hours gate judges the session in have to be the same zone, and two
+    separate `ZoneInfo(settings.bot_timezone)` calls are two chances to
+    disagree - which is how a cron and its market-hours gate end up four hours
+    apart without either looking wrong.
+    """
     return BackgroundScheduler(timezone=MARKET_TZ)
 
 
@@ -67,6 +84,33 @@ def local_order_status(alpaca_status) -> OrderStatus:
     if value in _NOT_FILLED:
         return OrderStatus.canceled
     return OrderStatus.submitted
+
+
+def _fill_from_order(order) -> tuple[float | None, float | None]:
+    """(filled_price, filled_qty) from a broker order, or (None, None).
+
+    The three SDK types meet here: `filled_avg_price` and `filled_qty` are
+    `Decimal`, and passing one straight into a `Float` column commits fine but
+    is the same class of boundary bug as the `uuid.UUID` order id (gotcha 5b).
+    Coerced explicitly rather than relying on the driver.
+
+    `None` is returned for an order with no fill *yet*, and that is a
+    meaningful value rather than a missing one: the reconciler finds work by
+    searching for NULLs, so writing 0.0 for an unfilled order would report a
+    fill that never happened and mark the row as already reconciled.
+
+    A partially filled order does return its partial. `partially_filled` is a
+    real state with real execution behind it, and it is the state most easily
+    misread as "nothing happened" - the order is still open, so the
+    reconciler keeps it, but the partial is data already paid for.
+    """
+    price = getattr(order, "filled_avg_price", None)
+    qty = getattr(order, "filled_qty", None)
+    if price is None or qty is None:
+        return None, None
+    if float(qty) <= 0:
+        return None, None
+    return float(price), float(qty)
 
 
 class BotWorker:
@@ -129,7 +173,20 @@ class BotWorker:
             id="config_check",
             replace_existing=True
         )
-        
+
+        # Fill reconciliation (issue #5). Registered unconditionally, not under
+        # the `is_running` branch above: an order placed on the last cycle
+        # before a stop still fills, and the row still has to learn what it
+        # cost. A reconciler gated on "the bot is currently running" would miss
+        # exactly the orders most likely to still be in flight.
+        self.scheduler.add_job(
+            self._reconcile_fills_job,
+            "interval",
+            minutes=1,
+            id="reconcile_fills",
+            replace_existing=True
+        )
+
         self.scheduler.start()
         self.running = True
         logger.info("Bot worker started")
@@ -232,19 +289,40 @@ class BotWorker:
                 logger.error("Failed to create Alpaca client (no credentials)")
                 return
             
-            # Check market clock
-            clock = await alpaca.get_clock()
-            if not clock.is_open:
-                logger.info("Market is closed, skipping cycle")
+            # Which window of the trading day is this?
+            #
+            # `clock.is_open` alone is not enough and never was. Alpaca reports
+            # it true from 04:00 to 20:00 ET, so gating on it places orders in
+            # pre-market and after-hours, and a position opened at 19:30 sits
+            # overnight with no liquidity behind it. bot_config
+            # .market_hours_only existed to prevent exactly that and was read
+            # by nothing at all (gotcha 17); it is read here now.
+            #
+            # The broker's own timestamp is the reference instant, so this does
+            # not depend on this container's clock agreeing with Alpaca's.
+            broker_clock = await alpaca.get_clock()
+            session_state = market_session_state(broker_clock)
+            market_hours_only = bool(bot_config.market_hours_only)
+
+            if not trading_allowed(session_state, market_hours_only):
+                # Says *which* window, on purpose. "Market is closed" for
+                # every non-regular session makes a correctly-idle bot
+                # indistinguishable from a broken one - the ambiguity that made
+                # issue #3's own evidence a timezone misread rather than the
+                # after-hours trading it was reported as.
+                logger.info(f"{skip_reason(session_state, market_hours_only)}, skipping cycle")
                 return
-            
+
+            if session_state != "regular":
+                logger.info(f"Trading in {session_state} (market_hours_only is off)")
+
             # Get account equity, plus the broker's own day P&L basis
             account = await alpaca.get_account()
             equity = float(account.equity)
             if equity <= 0:
                 logger.warning("Equity is zero or negative, skipping cycle")
                 return
-            
+
             # Equity vs the previous close is the only trustworthy daily loss
             # figure: TradeLog.pnl is never written, so the local sum is
             # always zero and the loss limit could never trigger.
@@ -255,24 +333,43 @@ class BotWorker:
                     f"Account is down {daily_loss_pct:.2%} from the previous close "
                     f"(equity {equity} vs last_equity {last_equity})"
                 )
-            
+
+            # The share of equity the strategies may size against (issue #6,
+            # "money to invest"). Every risk limit is a fraction of equity, so
+            # they are all evaluated against this same investable base - that is
+            # what makes a 20% cash reserve actually reserve cash instead of
+            # leaving the *limits* unchanged while shrinking the positions.
+            investable_equity = RiskManager.investable_equity(
+                equity, bot_config.capital_allocation_pct
+            )
+            logger.info(
+                f"Equity {equity:,.2f}, allocating "
+                f"{allocation_pct(bot_config.capital_allocation_pct):.0%} = "
+                f"{investable_equity:,.2f} investable; profile can deploy at most "
+                f"{profile.max_deployable_pct:.0%} of equity "
+                f"({profile.risk_max_concurrent_positions} positions x "
+                f"{profile.risk_max_position_pct:.0%})"
+            )
+
             # Get current positions from Alpaca
             positions = await alpaca.get_positions()
             current_position_symbols = {p.symbol for p in positions}
             current_positions_count = len(positions)
-            
-            # Run strategy to get signals
-            signals = await run_strategy(profile, alpaca)
+            deployed_value = sum(abs(float(p.market_value)) for p in positions)
+
+            # Run strategy to get signals. The investable base is passed in
+            # rather than left to the strategy fetching its own equity, so every
+            # strategy in the registry sizes the same way and the allocation
+            # setting cannot be honoured by one strategy and ignored by another.
+            signals = await run_strategy(profile, alpaca, investable_equity=investable_equity)
             if not signals:
                 logger.info("No signals generated")
-                await self._record_equity_snapshot(equity)
-                return
-            
-            logger.info(f"Generated {len(signals)} signals")
-            
+            else:
+                logger.info(f"Generated {len(signals)} signals")
+
             # Initialize risk manager
             risk_manager = RiskManager(self.db)
-            
+
             # Process each signal
             for signal in signals:
                 try:
@@ -289,7 +386,29 @@ class BotWorker:
                 except Exception as e:
                     logger.error(f"Error processing signal for {signal.symbol}: {e}")
                     continue
-            
+
+            # Idle cash, deployed by an explicit opt-in. Runs after the signal
+            # loop rather than inside it, so it never competes with a real
+            # signal for the concurrency budget and a sweep that fails cannot
+            # take a signal down with it.
+            #
+            # Reached on the no-signal path too, deliberately. A sweep exists
+            # for the quiet week - the one where the strategy found nothing and
+            # the cash would otherwise sit there indefinitely. Returning early
+            # when `signals` is empty would make it fire precisely when it is
+            # least wanted, which is the whole reason for it.
+            await self._maybe_sweep_cash(
+                profile=profile,
+                alpaca=alpaca,
+                risk_manager=risk_manager,
+                equity=equity,
+                investable_equity=investable_equity,
+                deployed_value=deployed_value,
+                current_positions_count=current_positions_count,
+                current_position_symbols=current_position_symbols,
+                daily_loss_pct=daily_loss_pct,
+            )
+
             # Record equity snapshot
             await self._record_equity_snapshot(equity)
             
@@ -382,20 +501,31 @@ class BotWorker:
             
             # Log the trade.
             #
-            # Both fields below need converting, and getting either wrong
-            # corrupts a trade that has already been placed:
+            # All three fields below need converting, and getting any of them
+            # wrong corrupts a trade that has already been placed:
             #
-            #   status         order.status is one of Alpaca's 18 values, none
-            #                  of which except filled/canceled/rejected exist in
-            #                  our OrderStatus enum. Writing it raw used to
-            #                  commit (SQLite has no CHECK here) and then poison
-            #                  the row, so the Activity tab could not load it.
+            #   status           order.status is one of Alpaca's 18 values, none
+            #                    of which except filled/canceled/rejected exist
+            #                    in our OrderStatus enum. Writing it raw used to
+            #                    commit (SQLite has no CHECK here) and then poison
+            #                    the row, so the Activity tab could not load it.
             #   alpaca_order_id  order.id is a uuid.UUID, which sqlite3 refuses
-            #                  to bind at all. That raised ProgrammingError on
-            #                  commit *after* the order was live at the broker,
-            #                  so the except branch below logged "Order failed"
-            #                  for an order that had really gone through, and
-            #                  the in-cycle position bookkeeping was skipped.
+            #                    to bind at all. That raised ProgrammingError on
+            #                    commit *after* the order was live at the broker,
+            #                    so the except branch below logged "Order failed"
+            #                    for an order that had really gone through, and
+            #                    the in-cycle position bookkeeping was skipped.
+            #   filled_*         Decimal, same coercion rule. Left out, these
+            #                    stayed NULL on every row ever written (issue
+            #                    #5) and nothing in the app noticed, because the
+            #                    columns had always been nullable.
+            #
+            # The fill is captured here when the broker has already filled -
+            # Alpaca frequently returns a filled market order straight from
+            # submit - and reconciled on a timer when it has not. Submit-time
+            # capture alone would fix the common case and silently leave the
+            # rest, which is the failure mode this comment exists to prevent.
+            filled_price, filled_qty = _fill_from_order(order)
             trade_log = TradeLog(
                 profile_id=profile.id,
                 symbol=symbol,
@@ -405,6 +535,8 @@ class BotWorker:
                 limit_price=signal.limit_price,
                 status=local_order_status(order.status).value,
                 alpaca_order_id=str(order.id),
+                filled_price=filled_price,
+                filled_qty=filled_qty,
                 message=f"Order placed: {side} {qty} {symbol} @ {signal.order_type}"
             )
             self.db.add(trade_log)
@@ -436,6 +568,200 @@ class BotWorker:
             self.db.add(trade_log)
             self.db.commit()
     
+    async def _maybe_sweep_cash(
+        self,
+        profile: StrategyProfile,
+        alpaca: AlpacaClient,
+        risk_manager: RiskManager,
+        equity: float,
+        investable_equity: float,
+        deployed_value: float,
+        current_positions_count: int,
+        current_position_symbols: set,
+        daily_loss_pct: float,
+    ) -> None:
+        """Put a bounded slice of idle cash into a broad instrument.
+
+        Issue #2's other half. A strategy trades on a signal, so a week in
+        which it finds nothing leaves the account's cash uninvested - and the
+        longer the quiet stretch, the more of the account is parked. The sweep
+        is a second, deliberately dumb strategy for exactly that window: buy
+        SPY (or whatever the operator picked) with a slice of the spare cash.
+
+        It is routed through `_process_signal` rather than calling
+        `submit_order` directly, so the sweep is subject to the same risk
+        checks, the same "already hold this" guard and the same log write as a
+        strategy signal. A second order path is a second set of rules, and the
+        rules are the whole reason this is safe.
+
+        Four conditions, all of which have to hold:
+
+        * **Opt-in.** `cash_sweep.enabled` in the profile's parameters, off by
+          default. SPY is a position like any other and the operator should
+          have to ask for it.
+        * **A real pct.** A block with a symbol and no percentage is an
+          unfinished setting, and reading it as "sweep everything spare" would
+          open with whatever accumulated over a quiet month.
+        * **Cash actually spare.** Measured as the gap between what is deployed
+          and what may be deployed - `investable_equity - deployed_value` - so
+          a full book sweeps nothing. Note it is the *investable* base, not
+          full equity: with a 20% cash reserve configured, that reserve is not
+          available to sweep and this is what enforces it.
+        * **Inside the per-position cap.** `min(sweep_pct, risk_max_position_pct)`
+          so a generous sweep pct cannot quietly open a larger position than
+          the profile's own limit allows.
+        """
+        if not profile.cash_sweep_enabled:
+            return
+
+        symbol = profile.cash_sweep_symbol
+        sweep_pct = profile.cash_sweep_pct
+        if not symbol or sweep_pct <= 0:
+            return
+
+        spare = investable_equity - deployed_value
+        if spare <= 0:
+            logger.debug("Cash sweep skipped: nothing spare to deploy")
+            return
+
+        # The per-position cap wins, exactly as it does in max_deployable_pct.
+        budget = min(investable_equity * sweep_pct, spare,
+                     investable_equity * float(profile.risk_max_position_pct or 0.0))
+        if budget <= 0:
+            return
+
+        try:
+            quote = await alpaca.get_latest_quote(symbol)
+            price = float(quote.ask_price)
+        except Exception as e:
+            logger.warning(f"Could not get a quote for cash sweep symbol {symbol}: {e}")
+            return
+
+        # Whole shares unless the profile opted into fractional sizing - the
+        # same rounding as every other position, so a sweep can never be the
+        # one order that breaches a cap by a fraction of a share.
+        qty = size_qty(budget, price, allow_fractional=bool(profile.allow_fractional_shares))
+        if qty <= 0:
+            logger.debug(
+                f"Cash sweep skipped: {budget:,.2f} will not buy a share of {symbol} "
+                f"at {price}"
+            )
+            return
+
+        logger.info(
+            f"Cash sweep: {qty} {symbol} (~{qty * price:,.2f}) from {budget:,.2f} "
+            f"of {spare:,.2f} spare ({sweep_pct:.0%} of investable)"
+        )
+
+        from app.bot.strategies.base import Signal
+
+        await self._process_signal(
+            signal=Signal(symbol=symbol, side="buy", qty=qty,
+                          order_type="market", estimated_price=price),
+            profile=profile,
+            alpaca=alpaca,
+            equity=equity,
+            current_positions_count=current_positions_count,
+            current_position_symbols=current_position_symbols,
+            risk_manager=risk_manager,
+            daily_loss_pct=daily_loss_pct,
+        )
+
+    def _reconcile_fills_job(self):
+        """Scheduled entry point for fill reconciliation.
+
+        Sync, like `_run_trading_cycle`: APScheduler runs jobs in a plain worker
+        thread and does not await coroutines, so an `async def` here would
+        create a coroutine and discard it (gotcha 9). One event loop per tick.
+        """
+        try:
+            asyncio.run(self._reconcile_fills())
+        except Exception as e:
+            # A bookkeeping read must never be able to kill the worker. This
+            # runs on its own timer, so an escaping exception would take out
+            # the trading cycle and the config poller with it.
+            logger.error(f"Fill reconciliation failed: {e}", exc_info=True)
+
+    async def _reconcile_fills(self, alpaca=None):
+        """Fill in `filled_price`/`filled_qty` on orders that have since filled.
+
+        Issue #5. The row is written the moment `submit_order` returns, and at
+        that moment a market order is usually `accepted` with no fill data - so
+        the fill lands at the broker a moment later and nothing ever went back
+        to look. Every one of the 52 rows in the live table is NULL on both
+        fields, and all 52 are `submitted`, which is what made this look like
+        the bot had never traded at all rather than a bot that cannot see its
+        own executions.
+
+        Three things bound the query, and all three are load-bearing:
+
+        * **Recent only.** Alpaca's order history is a bounded window, so an
+          unbounded "every row with a NULL fill" search re-checks rows whose
+          orders expired from the broker weeks ago. Every one of those is a
+          permanent 404, on every tick, forever.
+        * **Not cancelled, rejected or already-filled rows.** A row in a
+          terminal non-filled state will never fill; reconciling it forever is
+          pure waste, and `filled_price` staying NULL is the correct record of
+          "this never executed".
+        * **One row at a time, and one failure is contained.** The broker is
+          asked per order rather than for a batch, so a single 404 cannot take
+          the rest of the sweep down with it.
+
+        One commit for the whole sweep, not one per row: the same SQLite write
+        lock that serialises the worker against the backend (gotcha 18) is not
+        something to take once per order.
+        """
+        SessionLocal = get_session_local()
+        db = SessionLocal()
+        try:
+            cutoff = datetime.utcnow() - timedelta(hours=RECONCILE_MAX_AGE_HOURS)
+            rows = db.query(TradeLog).filter(
+                TradeLog.alpaca_order_id.isnot(None),
+                TradeLog.filled_qty.is_(None),
+                TradeLog.status == OrderStatus.submitted.value,
+                TradeLog.timestamp >= cutoff,
+            ).order_by(TradeLog.id).all()
+
+            if not rows:
+                return
+
+            alpaca = alpaca or self._get_alpaca_client()
+            if not alpaca:
+                return
+
+            updated = 0
+            for row in rows:
+                try:
+                    order = await alpaca.get_order(row.alpaca_order_id)
+                except Exception as e:
+                    # Expected, not exceptional: the order expired from the
+                    # broker's history. Logged at debug so a genuinely broken
+                    # key is still findable without filling the log with noise
+                    # that is actually normal operation.
+                    logger.debug(
+                        f"Could not re-read order {row.alpaca_order_id} "
+                        f"({row.symbol}): {e}"
+                    )
+                    continue
+
+                price, qty = _fill_from_order(order)
+                if qty is None:
+                    continue  # still open; keep it on the list
+
+                row.filled_price = price
+                row.filled_qty = qty
+                row.status = local_order_status(order.status).value
+                updated += 1
+
+            if updated:
+                db.commit()
+                logger.info(f"Reconciled fills on {updated} order(s)")
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Fill reconciliation error: {e}", exc_info=True)
+        finally:
+            db.close()
+
     async def _record_equity_snapshot(self, equity: float):
         """Record equity snapshot for equity curve"""
         try:

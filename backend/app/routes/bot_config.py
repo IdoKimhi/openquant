@@ -30,9 +30,25 @@ def _config_response(config: BotConfig) -> dict:
         "market_hours_only": config.market_hours_only,
         "active_profile_id": config.active_profile_id,
         "is_running": config.is_running,
+        "capital_allocation_pct": _allocation(config),
         "updated_at": config.updated_at,
         "cron_timezone": get_settings().bot_timezone,
     }
+
+
+def _allocation(config: BotConfig) -> float:
+    """The capital allocation actually in force, never None.
+
+    A row written before the column existed has NULL there, and this
+    application is deployed as a SQLite file on a volume rather than
+    recreated from the models, so NULL is a real state and not a theoretical
+    one. A NULL would otherwise reach the worker, where
+    `equity * None` raises TypeError inside the trading cycle.
+    """
+    value = config.capital_allocation_pct
+    if value is None:
+        return 1.0
+    return max(0.0, min(1.0, float(value)))
 
 
 @router.get("/config", response_model=BotConfigResponse)
@@ -70,6 +86,9 @@ def update_bot_config(
     for field, value in updates.items():
         setattr(config, field, value)
 
+    if "capital_allocation_pct" in updates and updates["capital_allocation_pct"] is not None:
+        config.capital_allocation_pct = _allocation(config)
+
     # Repointing the bot at a different profile has to move the `enabled` flag
     # with it. The worker resolves the profile through BOTH conditions:
     #
@@ -98,6 +117,7 @@ def update_bot_config(
         active_profile_id=config.active_profile_id,
         schedule_cron=config.schedule_cron,
         is_running=config.is_running,
+        capital_allocation_pct=_allocation(config),
     )
     return _config_response(config)
 

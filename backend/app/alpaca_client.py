@@ -40,11 +40,35 @@ class AlpacaClient:
         return self.trading.get_orders(req)
 
     async def submit_order(self, symbol: str, qty: float, side: str, order_type: str = "market", limit_price: float = None):
+        # Alpaca accepts a fractional quantity on a *market* order only. A
+        # fractional limit order is rejected by the broker, which costs a round
+        # trip and produces a "rejected" row in the activity log for what is
+        # really a misconfiguration. Refusing it here names the knob to turn.
+        #
+        # The bot only issues market orders today, so this is unreachable from
+        # the trading cycle; it belongs at the boundary regardless, because
+        # this is the one place that knows what the broker accepts.
+        if order_type != "market" and float(qty) % 1 != 0:
+            raise ValueError(
+                f"fractional quantity {qty} is only supported for market orders; "
+                f"set allow_fractional_shares on a market-order profile, or size "
+                f"this order in whole shares"
+            )
         if order_type == "market":
             req = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide(side), time_in_force=TimeInForce.DAY)
         else:
             req = LimitOrderRequest(symbol=symbol, qty=qty, side=OrderSide(side), limit_price=limit_price, time_in_force=TimeInForce.DAY)
         return self.trading.submit_order(req)
+
+    async def get_order(self, order_id: str):
+        """Re-read one order by id.
+
+        Exists for fill reconciliation (issue #5). The submit response is
+        whatever the order looked like at that instant - usually `accepted`,
+        with no fill data - so the only way to learn what an order actually
+        cost is to ask the broker again later.
+        """
+        return self.trading.get_order_by_id(order_id)
 
     async def cancel_all_orders(self):
         return self.trading.cancel_orders()
