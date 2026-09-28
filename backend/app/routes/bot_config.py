@@ -3,13 +3,19 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.models import BotConfig, StrategyProfile
 from app.schemas import BotConfigResponse, BotConfigUpdate
-from app.routes.auth import get_current_user
+from app.authz import (
+    SCOPE_BOT_CONTROL,
+    SCOPE_BOT_KILL,
+    SCOPE_CONFIG_WRITE,
+    SCOPE_READ,
+    require_scope,
+)
 
 router = APIRouter(prefix="/bot", tags=["bot"])
 
 
 @router.get("/config", response_model=BotConfigResponse)
-def get_bot_config(user=Depends(get_current_user), db: Session = Depends(get_db)):
+def get_bot_config(user=Depends(require_scope(SCOPE_READ)), db: Session = Depends(get_db)):
     config = db.query(BotConfig).first()
     if not config:
         config = BotConfig()
@@ -20,22 +26,49 @@ def get_bot_config(user=Depends(get_current_user), db: Session = Depends(get_db)
 
 
 @router.patch("/config", response_model=BotConfigResponse)
-def update_bot_config(data: BotConfigUpdate, user=Depends(get_current_user), db: Session = Depends(get_db)):
+def update_bot_config(data: BotConfigUpdate, user=Depends(require_scope(SCOPE_CONFIG_WRITE)), db: Session = Depends(get_db)):
     config = db.query(BotConfig).first()
     if not config:
         config = BotConfig()
         db.add(config)
     
-    for field, value in data.model_dump(exclude_unset=True).items():
+    updates = data.model_dump(exclude_unset=True)
+
+    # Validate before mutating anything, so a bad id cannot half-apply.
+    if "active_profile_id" in updates and updates["active_profile_id"]:
+        if not db.query(StrategyProfile).filter(
+            StrategyProfile.id == updates["active_profile_id"]
+        ).first():
+            raise HTTPException(400, "Profile not found")
+
+    for field, value in updates.items():
         setattr(config, field, value)
-    
+
+    # Repointing the bot at a different profile has to move the `enabled` flag
+    # with it. The worker resolves the profile through BOTH conditions:
+    #
+    #     StrategyProfile.id == config.active_profile_id,
+    #     StrategyProfile.enabled == True
+    #
+    # Patching active_profile_id on its own left `enabled` on the old profile,
+    # so the lookup matched nothing and every cycle bailed with "Active profile
+    # not found or disabled, skipping cycle" - a silent trading stop with no
+    # error anywhere in the UI. Clearing it disables the rest for the same
+    # reason: an enabled profile with nothing pointing at it is misleading.
+    if "active_profile_id" in updates:
+        db.query(StrategyProfile).update({StrategyProfile.enabled: False})
+        if config.active_profile_id:
+            db.query(StrategyProfile).filter(
+                StrategyProfile.id == config.active_profile_id
+            ).update({StrategyProfile.enabled: True})
+
     db.commit()
     db.refresh(config)
     return config
 
 
 @router.post("/start")
-def start_bot(user=Depends(get_current_user), db: Session = Depends(get_db)):
+def start_bot(user=Depends(require_scope(SCOPE_BOT_CONTROL)), db: Session = Depends(get_db)):
     config = db.query(BotConfig).first()
     if not config:
         config = BotConfig()
@@ -58,7 +91,7 @@ def start_bot(user=Depends(get_current_user), db: Session = Depends(get_db)):
 
 
 @router.post("/stop")
-def stop_bot(user=Depends(get_current_user), db: Session = Depends(get_db)):
+def stop_bot(user=Depends(require_scope(SCOPE_BOT_CONTROL)), db: Session = Depends(get_db)):
     config = db.query(BotConfig).first()
     if not config:
         config = BotConfig()
@@ -69,7 +102,7 @@ def stop_bot(user=Depends(get_current_user), db: Session = Depends(get_db)):
 
 
 @router.post("/pause")
-def pause_bot(user=Depends(get_current_user), db: Session = Depends(get_db)):
+def pause_bot(user=Depends(require_scope(SCOPE_BOT_CONTROL)), db: Session = Depends(get_db)):
     # Same as stop for now
     config = db.query(BotConfig).first()
     if not config:
@@ -81,7 +114,7 @@ def pause_bot(user=Depends(get_current_user), db: Session = Depends(get_db)):
 
 
 @router.post("/kill-switch")
-async def kill_switch(user=Depends(get_current_user), db: Session = Depends(get_db)):
+async def kill_switch(user=Depends(require_scope(SCOPE_BOT_KILL)), db: Session = Depends(get_db)):
     # Get credentials
     from app.models import ApiCredentials
     from app.security import decrypt

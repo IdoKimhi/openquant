@@ -129,38 +129,38 @@ export function SchedulePage() {
   return (
     <div className="max-w-2xl mx-auto space-y-6">
       <div>
-        <h1 className="text-2xl font-bold text-gray-900">Schedule & Settings</h1>
-        <p className="mt-1 text-sm text-gray-500">
+        <h1 className="text-2xl font-bold text-body">Schedule & Settings</h1>
+        <p className="mt-1 text-sm text-muted">
           Configure when the bot runs and which strategy profile to use.
         </p>
       </div>
       
       {/* Current Status */}
       <div className="card">
-        <h2 className="text-lg font-medium text-gray-900 mb-4">Current Configuration</h2>
+        <h2 className="text-lg font-medium text-body mb-4">Current Configuration</h2>
         {config && (
           <dl className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
             <div>
-              <dt className="text-gray-500">Schedule</dt>
-              <dd className="font-mono text-gray-900">{config.schedule_cron}</dd>
-              <dd className="text-gray-500 mt-1">{currentCronDesc}</dd>
+              <dt className="text-muted">Schedule</dt>
+              <dd className="font-mono text-body">{config.schedule_cron}</dd>
+              <dd className="text-muted mt-1">{currentCronDesc}</dd>
             </div>
             <div>
-              <dt className="text-gray-500">Market Hours Only</dt>
-              <dd className="font-medium text-gray-900">
+              <dt className="text-muted">Market Hours Only</dt>
+              <dd className="font-medium text-body">
                 {config.market_hours_only ? 'Yes' : 'No'}
               </dd>
             </div>
             <div>
-              <dt className="text-gray-500">Active Profile</dt>
-              <dd className="font-medium text-gray-900">
+              <dt className="text-muted">Active Profile</dt>
+              <dd className="font-medium text-body">
                 {config.active_profile_id
                   ? profiles.find(p => p.id === config.active_profile_id)?.name || `ID: ${config.active_profile_id}`
                   : 'None selected'}
               </dd>
             </div>
             <div>
-              <dt className="text-gray-500">Bot Status</dt>
+              <dt className="text-muted">Bot Status</dt>
               <dd className="font-medium">
                 <span className={`badge ${config.is_running ? 'badge-success' : 'badge-gray'}`}>
                   {config.is_running ? 'Running' : 'Stopped'}
@@ -173,12 +173,12 @@ export function SchedulePage() {
       
       {/* Schedule Form */}
       <div className="card">
-        <h2 className="text-lg font-medium text-gray-900 mb-4">Update Schedule</h2>
+        <h2 className="text-lg font-medium text-body mb-4">Update Schedule</h2>
         
         {(error || success) && (
           <div className={`mb-4 p-3 rounded-md text-sm flex items-center ${
-            error ? 'bg-red-50 border border-red-200 text-red-800' :
-            'bg-green-50 border border-green-200 text-green-800'
+            error ? 'bg-danger-soft border border-line-danger text-danger-fg' :
+            'bg-success-soft border border-line-success text-success-fg'
           }`}>
             {error && <AlertCircle className="h-4 w-4 mr-2" />}
             {success && <Check className="h-4 w-4 mr-2" />}
@@ -201,21 +201,21 @@ export function SchedulePage() {
                     aria-pressed={selected}
                     className={`relative cursor-pointer p-3 border rounded-lg transition-colors text-left ${
                       selected
-                        ? 'border-blue-500 bg-blue-50'
-                        : 'border-gray-200 hover:border-gray-300'
+                        ? 'border-accent bg-accent-soft'
+                        : 'border-line hover:border-line-strong'
                     }`}
                   >
                     <div className="flex items-center">
                       <div className={`h-4 w-4 border rounded ${
                         selected
-                          ? 'border-blue-500 bg-blue-500'
-                          : 'border-gray-300'
+                          ? 'border-accent bg-accent'
+                          : 'border-line-strong'
                       } relative`}>
                         {selected && (
                           <Check className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-3 w-3 text-white" />
                         )}
                       </div>
-                      <span className="ml-3 text-sm text-gray-700">{preset.label}</span>
+                      <span className="ml-3 text-sm text-body">{preset.label}</span>
                     </div>
                   </button>
                 )
@@ -231,9 +231,9 @@ export function SchedulePage() {
                 placeholder="e.g., */10 9-16 * * MON-FRI"
               />
               {form.formState.errors.schedule_cron && (
-                <p className="mt-1 text-sm text-red-600">{form.formState.errors.schedule_cron.message}</p>
+                <p className="mt-1 text-sm text-danger-fg">{form.formState.errors.schedule_cron.message}</p>
               )}
-              <p className="mt-1 text-xs text-gray-500">
+              <p className="mt-1 text-xs text-muted">
                 Uses standard cron format: minute hour day-of-month month day-of-week
                 <br />
                 Timezone: UTC (Alpaca uses ET for market hours)
@@ -242,11 +242,11 @@ export function SchedulePage() {
           </div>
           
           {/* Market Hours Toggle */}
-          <div className="border-t border-gray-200 pt-6">
+          <div className="border-t border-line pt-6">
             <div className="flex items-center justify-between">
               <div>
                 <label className="label">Market Hours Only</label>
-                <p className="text-sm text-gray-500">
+                <p className="text-sm text-muted">
                   Only run during US market hours (9:30 AM - 4:00 PM ET, Mon-Fri)
                 </p>
               </div>
@@ -254,13 +254,13 @@ export function SchedulePage() {
                 type="button"
                 onClick={() => form.setValue('market_hours_only', !form.watch('market_hours_only'))}
                 className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                  form.watch('market_hours_only') ? 'bg-blue-600' : 'bg-gray-200'
+                  form.watch('market_hours_only') ? 'bg-accent' : 'bg-line'
                 }`}
                 role="switch"
                 aria-checked={form.watch('market_hours_only')}
               >
                 <span
-                  className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                  className={`inline-block h-4 w-4 transform rounded-full bg-surface transition-transform ${
                     form.watch('market_hours_only') ? 'translate-x-6' : 'translate-x-1'
                   }`}
                 />
@@ -269,7 +269,7 @@ export function SchedulePage() {
           </div>
           
           {/* Active Profile */}
-          <div className="border-t border-gray-200 pt-6">
+          <div className="border-t border-line pt-6">
             <label className="label">Active Strategy Profile</label>
             <select
               {...form.register('active_profile_id', { valueAsNumber: true })}
@@ -283,8 +283,8 @@ export function SchedulePage() {
               ))}
             </select>
             {profiles.filter(p => p.enabled).length === 0 && (
-              <p className="mt-1 text-sm text-gray-500">
-                No enabled profiles available. <a href="/strategy" className="text-blue-600 hover:underline">Create one first</a>.
+              <p className="mt-1 text-sm text-muted">
+                No enabled profiles available. <a href="/strategy" className="text-accent hover:underline">Create one first</a>.
               </p>
             )}
           </div>
@@ -311,18 +311,18 @@ export function SchedulePage() {
       </div>
       
       {/* Cron Help */}
-      <div className="card bg-gray-50 border-gray-200">
-        <h3 className="font-medium text-gray-900 mb-3">Cron Expression Reference</h3>
+      <div className="card bg-canvas border-line">
+        <h3 className="font-medium text-body mb-3">Cron Expression Reference</h3>
         <div className="overflow-x-auto">
           <table className="w-full text-sm text-left">
             <thead>
-              <tr className="text-gray-500 border-b border-gray-200">
+              <tr className="text-muted border-b border-line">
                 <th className="pb-2 font-medium w-24">Field</th>
                 <th className="pb-2 font-medium">Values</th>
                 <th className="pb-2 font-medium">Special</th>
               </tr>
             </thead>
-            <tbody className="text-gray-700 divide-y divide-gray-200">
+            <tbody className="text-body divide-y divide-line">
               <tr><td className="py-2 font-mono">Minute</td><td className="py-2">0-59</td><td className="py-2">*, */n, n-m</td></tr>
               <tr><td className="py-2 font-mono">Hour</td><td className="py-2">0-23 (UTC)</td><td className="py-2">*, */n, n-m</td></tr>
               <tr><td className="py-2 font-mono">Day of Month</td><td className="py-2">1-31</td><td className="py-2">*, ?, L, W</td></tr>
@@ -331,8 +331,8 @@ export function SchedulePage() {
             </tbody>
           </table>
         </div>
-        <p className="mt-3 text-xs text-gray-500">
-          Example: <code className="font-mono bg-gray-200 px-1 rounded">*/5 9-16 * * MON-FRI</code> = Every 5 minutes, 9AM-4PM UTC, Monday-Friday
+        <p className="mt-3 text-xs text-muted">
+          Example: <code className="font-mono bg-line px-1 rounded">*/5 9-16 * * MON-FRI</code> = Every 5 minutes, 9AM-4PM UTC, Monday-Friday
         </p>
       </div>
     </div>

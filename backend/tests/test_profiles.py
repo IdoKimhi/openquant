@@ -109,6 +109,66 @@ def test_delete_profile():
     assert get_resp.status_code == 404
 
 
+def test_activate_profile_sets_active_profile_id():
+    """Activating a profile must also point the bot at it.
+
+    `enabled` and `bot_config.active_profile_id` are two different things and
+    the worker only ever reads the latter:
+
+        worker/scheduler.py ->
+            StrategyProfile.id == bot_config.active_profile_id,
+            StrategyProfile.enabled == True
+
+    The old activate endpoint only flipped `enabled`, so a user who created a
+    second profile and clicked "Activate" saw the UI relabel it Active while
+    the bot silently kept trading the profile named by active_profile_id. The
+    two are now written together.
+    """
+    headers = {"Authorization": f"Bearer {get_auth_token()}"}
+    data1 = {
+        "name": "Alpha",
+        "strategy_type": "sma_crossover",
+        "parameters": {"fast_period": 10, "slow_period": 30, "position_size_pct": 0.1},
+        "risk_max_position_pct": 0.1,
+        "risk_max_daily_loss_pct": 0.05,
+        "risk_max_concurrent_positions": 5,
+        "symbols": ["AAPL"],
+    }
+    data2 = {
+        "name": "Beta",
+        "strategy_type": "rsi_reversion",
+        "parameters": {"period": 14, "oversold": 30, "overbought": 70, "position_size_pct": 0.1},
+        "risk_max_position_pct": 0.1,
+        "risk_max_daily_loss_pct": 0.05,
+        "risk_max_concurrent_positions": 5,
+        "symbols": ["MSFT"],
+    }
+    id1 = client.post("/profiles", json=data1, headers=headers).json()["id"]
+    id2 = client.post("/profiles", json=data2, headers=headers).json()["id"]
+
+    client.post(f"/profiles/{id1}/activate", headers=headers)
+    cfg = client.get("/bot/config", headers=headers).json()
+    assert cfg["active_profile_id"] == id1, "activating must set active_profile_id"
+
+    client.post(f"/profiles/{id2}/activate", headers=headers)
+    cfg = client.get("/bot/config", headers=headers).json()
+    assert cfg["active_profile_id"] == id2, "re-activating must move active_profile_id"
+
+
+def test_activate_profile_404_for_missing_profile():
+    """A bad id must not leave a dangling active_profile_id pointing nowhere.
+
+    The endpoint re-points the bot before it looks the profile up, so the
+    ordering matters: the 404 has to happen first.
+    """
+    headers = {"Authorization": f"Bearer {get_auth_token()}"}
+    resp = client.post("/profiles/999999/activate", headers=headers)
+    assert resp.status_code == 404
+
+    cfg = client.get("/bot/config", headers=headers).json()
+    assert cfg["active_profile_id"] is None
+
+
 def test_activate_profile():
     headers = {"Authorization": f"Bearer {get_auth_token()}"}
     # Create two profiles

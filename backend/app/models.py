@@ -55,6 +55,35 @@ class StrategyProfile(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class AgentKey(Base):
+    """A scoped credential for an external agent.
+
+    Separate from the admin password on purpose. The admin credential is a
+    single shared secret that mints one JWT shape for every route, which is
+    fine for one human on one browser but useless for a machine caller: an
+    agent's actions are untraceable, it cannot be revoked without locking the
+    human out, and it has all-or-nothing access to the kill switch.
+
+    Only the hash of the key is stored. `key_prefix` is the lookup handle and
+    is safe to render in the UI; `key_hash` is sha256 of the full plaintext and
+    is the only thing that can authenticate.
+    """
+    __tablename__ = "agent_keys"
+
+    id = Column(Integer, primary_key=True, index=True)
+    label = Column(String, nullable=False)
+    key_prefix = Column(String, nullable=False, index=True)
+    key_hash = Column(String, nullable=False, unique=True, index=True)
+    scopes = Column(JSON, nullable=False, default=list)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_used_at = Column(DateTime, nullable=True)
+    revoked_at = Column(DateTime, nullable=True)
+
+    @property
+    def is_active(self) -> bool:
+        return self.revoked_at is None
+
+
 class BotConfig(Base):
     __tablename__ = "bot_config"
 

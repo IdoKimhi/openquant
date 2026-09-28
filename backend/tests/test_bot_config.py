@@ -125,3 +125,71 @@ def test_start_bot_requires_active_profile():
     # Try to start without active profile
     resp = client.post("/bot/start", headers=headers)
     assert resp.status_code == 400
+
+def _mkprofile(name):
+    headers = {"Authorization": f"Bearer {get_auth_token()}"}
+    return client.post("/profiles", json={
+        "name": name,
+        "strategy_type": "sma_crossover",
+        "parameters": {"fast_period": 10, "slow_period": 30, "position_size_pct": 0.1},
+        "risk_max_position_pct": 0.1,
+        "risk_max_daily_loss_pct": 0.05,
+        "risk_max_concurrent_positions": 5,
+        "symbols": ["AAPL"],
+    }, headers=headers).json()["id"]
+
+
+def test_patch_active_profile_id_keeps_enabled_in_sync():
+    """PATCH /bot/config must not be able to strand the bot on a profile it will not trade.
+
+    The worker requires BOTH conditions to line up:
+
+        StrategyProfile.id == bot_config.active_profile_id,
+        StrategyProfile.enabled == True
+
+    PATCHing active_profile_id on its own (which SchedulePage does) left
+    `enabled` pointing at a different profile, so the query matched nothing,
+    every cycle logged "Active profile not found or disabled, skipping cycle",
+    and the bot went quiet with no error surfaced anywhere in the UI. Writing
+    active_profile_id now moves the `enabled` flag with it.
+    """
+    headers = {"Authorization": f"Bearer {get_auth_token()}"}
+    a, b = _mkprofile("A"), _mkprofile("B")
+    client.post(f"/profiles/{a}/activate", headers=headers)
+
+    # Point the bot at B without going through /activate.
+    client.patch("/bot/config", json={"active_profile_id": b}, headers=headers)
+
+    cfg = client.get("/bot/config", headers=headers).json()
+    assert cfg["active_profile_id"] == b
+
+    profs = {p["id"]: p for p in client.get("/profiles", headers=headers).json()}
+    assert profs[b]["enabled"] is True, "the newly active profile must be enabled"
+    assert profs[a]["enabled"] is False, "the previous one must be disabled"
+
+    # This is the exact lookup the worker performs each cycle.
+    SessionLocal = get_session_local()
+    db = SessionLocal()
+    try:
+        resolved = db.query(StrategyProfile).filter(
+            StrategyProfile.id == cfg["active_profile_id"],
+            StrategyProfile.enabled == True,
+        ).first()
+    finally:
+        db.close()
+    assert resolved is not None, "worker would skip every cycle if this is None"
+    assert resolved.id == b
+
+
+def test_patch_active_profile_id_null_disables_all():
+    """Clearing active_profile_id must not leave a stale 'enabled' profile behind."""
+    headers = {"Authorization": f"Bearer {get_auth_token()}"}
+    a = _mkprofile("Solo")
+    client.post(f"/profiles/{a}/activate", headers=headers)
+
+    client.patch("/bot/config", json={"active_profile_id": None}, headers=headers)
+
+    cfg = client.get("/bot/config", headers=headers).json()
+    assert cfg["active_profile_id"] is None
+    profs = {p["id"]: p for p in client.get("/profiles", headers=headers).json()}
+    assert profs[a]["enabled"] is False

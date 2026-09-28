@@ -8,52 +8,57 @@ import { StrategyPage } from './pages/StrategyPage'
 import { SchedulePage } from './pages/SchedulePage'
 import { ControlPage } from './pages/ControlPage'
 import { DashboardPage } from './pages/DashboardPage'
+import { AgentsPage } from './pages/AgentsPage'
 import { useAuth, AuthProvider } from './hooks/useAuth'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { isAuthenticated, loading } = useAuth()
-  
+
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-50">
-        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
+      <div className="min-h-screen flex items-center justify-center bg-canvas">
+        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-accent"></div>
       </div>
     )
   }
-  
+
   if (!isAuthenticated) {
     return <Navigate to="/login" replace />
   }
-  
+
   return <>{children}</>
 }
 
 function App() {
   return (
-    <div className="min-h-screen bg-gray-50">
-      <AuthProvider>
-        <Routes>
-          <Route path="/login" element={<LoginPage />} />
-          <Route
-            path="/*"
-            element={
-              <ProtectedRoute>
-                <Layout>
-                  <Sidebar />
-                </Layout>
-              </ProtectedRoute>
-            }
-          >
-            <Route index element={<Navigate to="/dashboard" replace />} />
-            <Route path="setup" element={<SetupPage />} />
-            <Route path="strategy" element={<StrategyPage />} />
-            <Route path="schedule" element={<SchedulePage />} />
-            <Route path="control" element={<ControlPage />} />
-            <Route path="dashboard" element={<DashboardPage />} />
-          </Route>
-        </Routes>
-      </AuthProvider>
-    </div>
+    <AuthProvider>
+      <Routes>
+        <Route path="/login" element={<LoginPage />} />
+        <Route
+          path="/*"
+          element={
+            <ProtectedRoute>
+              {/* Sidebar and Layout are siblings. They used to be nested, with
+                  the sidebar passed into Layout as children - which is why
+                  Layout had to render both <Outlet/> and {children}, and the
+                  sidebar ended up mounted twice. */}
+              <div className="min-h-screen bg-canvas">
+                <Sidebar />
+                <Layout />
+              </div>
+            </ProtectedRoute>
+          }
+        >
+          <Route index element={<Navigate to="/dashboard" replace />} />
+          <Route path="setup" element={<SetupPage />} />
+          <Route path="strategy" element={<StrategyPage />} />
+          <Route path="schedule" element={<SchedulePage />} />
+          <Route path="control" element={<ControlPage />} />
+          <Route path="dashboard" element={<DashboardPage />} />
+          <Route path="agents" element={<AgentsPage />} />
+        </Route>
+      </Routes>
+    </AuthProvider>
   )
 }
 
@@ -66,54 +71,52 @@ function LoginPage() {
   if (isAuthenticated) {
     return <Navigate to="/dashboard" replace />
   }
-  
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     await login(password)
   }
-  
+
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gray-50 px-4">
+    <div className="min-h-screen flex items-center justify-center bg-canvas px-4">
       <div className="max-w-md w-full space-y-8">
         <div>
-          <h2 className="mt-6 text-center text-3xl font-extrabold text-gray-900">
-            Alpaca Paper Bot
+          <h2 className="mt-6 text-center text-3xl font-extrabold text-body">
+            OpenQuant
           </h2>
-          <p className="mt-2 text-center text-sm text-gray-600">
+          <p className="mt-2 text-center text-sm text-muted">
             Sign in to access your trading dashboard
           </p>
         </div>
         <form className="mt-8 space-y-6" onSubmit={handleSubmit}>
-          <div className="rounded-md shadow-sm -space-y-px">
-            <div>
-              <label htmlFor="password" className="sr-only">
-                Password
-              </label>
-              <input
-                id="password"
-                name="password"
-                type="password"
-                autoComplete="current-password"
-                required
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                className="appearance-none rounded-none relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-t-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 focus:z-10 sm:text-sm"
-                placeholder="Password"
-              />
-            </div>
+          <div>
+            <label htmlFor="password" className="sr-only">
+              Password
+            </label>
+            <input
+              id="password"
+              name="password"
+              type="password"
+              autoComplete="current-password"
+              required
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className="input"
+              placeholder="Password"
+            />
           </div>
-          
+
           {error && (
-            <div className="text-red-600 text-sm text-center" role="alert">
+            <div className="text-danger text-sm text-center" role="alert">
               {error}
             </div>
           )}
-          
+
           <div>
             <button
               type="submit"
               disabled={loading}
-              className="group relative w-full flex justify-center py-2 px-4 border border-transparent text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+              className="btn-primary w-full"
             >
               {loading ? 'Signing in...' : 'Sign in'}
             </button>

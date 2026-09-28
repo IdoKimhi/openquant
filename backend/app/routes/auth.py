@@ -29,6 +29,10 @@ def verify(credentials: HTTPAuthorizationCredentials = Depends(security)):
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
+# Kept for any route that only ever serves the human. New code should use
+# `app.authz.require_human()`, or `require_scope(...)` where an agent key is
+# genuinely allowed. An agent key hitting this gets 403, not 401 - the token
+# was valid, the principal just is not a human.
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         return verify_token(credentials.credentials)

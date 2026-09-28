@@ -1,9 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.db import init_db
-from app.routes import auth, credentials, profiles, bot_config, dashboard
+from app.routes import auth, agent_keys, bot_config, credentials, dashboard, profiles
 
-app = FastAPI(title="Alpaca Paper Trading Bot", version="1.0.0")
+app = FastAPI(title="OpenQuant Agent API", version="1.1.0")
 
 # CORS for frontend
 app.add_middleware(
@@ -20,6 +20,9 @@ app.include_router(credentials.router)
 app.include_router(profiles.router)
 app.include_router(bot_config.router)
 app.include_router(dashboard.router)
+# Human-only: minting and revoking agent keys is how access is granted, so an
+# agent key must not be able to mint itself another one.
+app.include_router(agent_keys.router)
 
 
 @app.on_event("startup")

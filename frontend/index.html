@@ -4,7 +4,31 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Alpaca Paper Trading Bot</title>
+    <title>OpenQuant</title>
+    <script>
+      // Resolve the theme before first paint.
+      //
+      // Without this, a user on a dark OS gets a full white flash: React mounts
+      // after CSS has already painted the light tokens, and only then does the
+      // provider add .dark. This has to be a blocking inline script in <head>
+      // for that reason - deferring it, or moving it into the bundle, restores
+      // the flash.
+      //
+      // useTheme() seeds itself from the class this sets rather than repeating
+      // the logic, so the two cannot disagree. Keep the key in sync with
+      // STORAGE_KEY in src/hooks/useTheme.tsx.
+      (function () {
+        try {
+          var stored = localStorage.getItem('openquant.theme')
+          var dark = stored
+            ? stored === 'dark'
+            : window.matchMedia('(prefers-color-scheme: dark)').matches
+          if (dark) document.documentElement.classList.add('dark')
+        } catch (e) {
+          /* storage blocked - fall through to the light default */
+        }
+      })()
+    </script>
   </head>
   <body>
     <div id="root"></div>

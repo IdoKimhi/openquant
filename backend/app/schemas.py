@@ -1,6 +1,7 @@
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional, List
 from datetime import datetime
+from app.authz import ALL_SCOPES, DEFAULT_SCOPES
 from app.models import StrategyType, OrderSide, OrderType, OrderStatus
 
 
@@ -16,6 +17,62 @@ class TokenResponse(BaseModel):
 class VerifyResponse(BaseModel):
     valid: bool
     user: str
+
+
+# Agent keys
+class AgentKeyCreate(BaseModel):
+    label: str = Field(min_length=1, max_length=100)
+    # Defaults to read-only. An empty scope list would mint a key that
+    # authenticates and then does nothing, which reads as a broken integration
+    # rather than a deliberate restriction.
+    scopes: List[str] = Field(default_factory=lambda: list(DEFAULT_SCOPES), min_length=1)
+
+    @field_validator("scopes")
+    @classmethod
+    def _validate_scopes(cls, v):
+        unknown = [s for s in v if s not in ALL_SCOPES]
+        if unknown:
+            raise ValueError(f"Unknown scope(s): {', '.join(unknown)}")
+        # Stable order so the stored value and the UI agree, and so two
+        # identical requests produce identical rows.
+        return [s for s in ALL_SCOPES if s in v]
+
+
+class AgentKeyResponse(BaseModel):
+    """Never contains the key itself - only the prefix, which is a lookup
+    handle and cannot authenticate."""
+
+    id: int
+    label: str
+    key_prefix: str
+    scopes: List[str]
+    created_at: datetime
+    last_used_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class AgentKeyCreated(AgentKeyResponse):
+    """Returned exactly once, at creation. The plaintext is unrecoverable after
+    this - only its sha256 was persisted."""
+
+    key: str
+
+
+class ScopeInfo(BaseModel):
+    """Mirrors an entry in app.authz.SCOPE_INFO."""
+
+    name: str
+    label: str
+    description: str
+    danger: str
+    granted_by_default: bool
+
+
+class ScopeCatalogue(BaseModel):
+    scopes: List[ScopeInfo]
 
 
 # Credentials

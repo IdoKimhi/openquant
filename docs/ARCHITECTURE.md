@@ -43,13 +43,21 @@ All services share a SQLite database via a named Docker volume (`bot_data`).
 - **Routing**: React Router v6
 - **State**: React Hook Form + Zod validation
 - **Charts**: Recharts for equity curve visualization
+- **Theming**: CSS custom properties, declared once for light (`:root`) and once for dark
+  (`.dark`), exposed to Tailwind as semantic colour names. `darkMode: 'class'`, toggled by a
+  class on `<html>`. A blocking script in `index.html` applies the class before first paint to
+  avoid a flash. The `dark:` variant is used nowhere - components name a role, not a value.
 - **API Client**: Axios with JWT interceptor
 - **Build**: Multi-stage Docker build (Node builder → Nginx runtime)
 
 ### Backend
 - **Framework**: FastAPI with Uvicorn ASGI server
 - **Database**: SQLAlchemy 2.0 + SQLite (async not needed for SQLite)
-- **Authentication**: JWT tokens with bcrypt password hashing
+- **Authentication**: two principals against one endpoint set
+  - *user*: single password → bcrypt → JWT (`app/security.py`, `app/routes/auth.py`)
+  - *agent*: `oq_`-prefixed key → sha256 lookup → scope check (`app/authz.py`)
+  `get_current_principal` resolves either. Routes declare `require_scope(...)` for the scopes
+  they accept, or `require_human()` where an agent key must never be admitted.
 - **Encryption**: Fernet (AES-128-GCM) for Alpaca API credentials
 - **API**: RESTful endpoints with Pydantic validation
 
@@ -102,6 +110,26 @@ All services share a SQLite database via a named Docker volume (`bot_data`).
 - JWT tokens for session management (24hr expiry)
 - Tokens stored in localStorage, sent via Authorization header
 
+### Agent authorization
+The admin credential is unsuitable for a machine caller: its actions are untraceable, it
+cannot be revoked without locking the human out, and it is all-or-nothing on the kill switch.
+Agent access is therefore a separate credential in a separate table, accepted by the same
+routes.
+
+- Key format `oq_` + 32 bytes of `token_urlsafe`. Stored as a **SHA-256 hash** plus an
+  11-char `key_prefix` used as the lookup handle; the plaintext is returned once at creation
+  and is unrecoverable afterwards.
+- Scopes: `read`, `config:write`, `bot:control`, `bot:kill`. Nothing is granted implicitly.
+  A new key gets `read` only; `bot:kill` is never a default.
+- Revocation is soft (`revoked_at`) so the row remains as evidence the key existed. A revoked
+  key resolves to no principal, and the next request is `401`.
+- `last_used_at` is written on every successful agent authentication.
+- **Human-only by construction:** `/credentials` (overwrites the broker key) and `/agent-keys`
+  (mints access) both use `require_human()`. An agent that could reach either could take the
+  account or escalate itself, which would make the scope model decorative.
+- There is no agent-facing order-placement endpoint. An agent can reconfigure a bot which
+  places orders, but cannot itself place one.
+
 ### Network
 - Paper trading endpoint hardcoded (`https://paper-api.alpaca.markets`)
 - No live trading possible by design
@@ -111,6 +139,7 @@ All services share a SQLite database via a named Docker volume (`bot_data`).
 
 ### Tables
 - `api_credentials` - Encrypted Alpaca API keys
+- `agent_keys` - Scoped agent credentials (label, key prefix, key hash, scopes, revoked_at)
 - `strategy_profiles` - Strategy configurations with risk params
 - `bot_config` - Global bot settings (schedule, active profile)
 - `trade_logs` - All executed trades with PnL
@@ -119,6 +148,7 @@ All services share a SQLite database via a named Docker volume (`bot_data`).
 ### Key Relationships
 - `BotConfig.active_profile_id` → `StrategyProfile.id` (FK)
 - `TradeLog.profile_id` → `StrategyProfile.id` (FK, nullable)
+- `agent_keys` has no FKs; it is a standalone credential
 
 ### Column typing at the broker boundary
 `trade_logs.status` and `alpaca_order_id` are free text (`String`), not enums, and the

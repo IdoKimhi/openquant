@@ -8,7 +8,7 @@ from app.schemas import (
 )
 from app.alpaca_client import AlpacaClient
 from app.security import decrypt
-from app.routes.auth import get_current_user
+from app.authz import SCOPE_READ, require_scope
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -21,7 +21,7 @@ def get_alpaca_client(db: Session) -> AlpacaClient | None:
 
 
 @router.get("/account", response_model=AccountResponse)
-async def get_account(user=Depends(get_current_user), db: Session = Depends(get_db)):
+async def get_account(user=Depends(require_scope(SCOPE_READ)), db: Session = Depends(get_db)):
     client = get_alpaca_client(db)
     if not client:
         raise HTTPException(400, "No credentials stored")
@@ -41,7 +41,7 @@ async def get_account(user=Depends(get_current_user), db: Session = Depends(get_
 
 
 @router.get("/positions", response_model=list[PositionResponse])
-async def get_positions(user=Depends(get_current_user), db: Session = Depends(get_db)):
+async def get_positions(user=Depends(require_scope(SCOPE_READ)), db: Session = Depends(get_db)):
     client = get_alpaca_client(db)
     if not client:
         raise HTTPException(400, "No credentials stored")
@@ -64,7 +64,7 @@ async def get_positions(user=Depends(get_current_user), db: Session = Depends(ge
 
 
 @router.get("/orders", response_model=list[OrderResponse])
-async def get_orders(user=Depends(get_current_user), db: Session = Depends(get_db)):
+async def get_orders(user=Depends(require_scope(SCOPE_READ)), db: Session = Depends(get_db)):
     client = get_alpaca_client(db)
     if not client:
         raise HTTPException(400, "No credentials stored")
@@ -93,7 +93,7 @@ async def get_orders(user=Depends(get_current_user), db: Session = Depends(get_d
 
 
 @router.get("/equity-curve", response_model=list[EquityPoint])
-def get_equity_curve(user=Depends(get_current_user), db: Session = Depends(get_db)):
+def get_equity_curve(user=Depends(require_scope(SCOPE_READ)), db: Session = Depends(get_db)):
     # Get last 30 days of equity snapshots
     from datetime import datetime, timedelta
     cutoff = datetime.utcnow() - timedelta(days=30)
@@ -109,7 +109,7 @@ def get_equity_curve(user=Depends(get_current_user), db: Session = Depends(get_d
 
 @router.get("/logs", response_model=list[TradeLogResponse])
 def get_logs(
-    user=Depends(get_current_user), 
+    user=Depends(require_scope(SCOPE_READ)), 
     db: Session = Depends(get_db),
     limit: int = 100,
     profile_id: int | None = None
@@ -121,7 +121,7 @@ def get_logs(
 
 
 @router.get("/market-clock", response_model=MarketClockResponse)
-async def get_market_clock(user=Depends(get_current_user), db: Session = Depends(get_db)):
+async def get_market_clock(user=Depends(require_scope(SCOPE_READ)), db: Session = Depends(get_db)):
     client = get_alpaca_client(db)
     if not client:
         raise HTTPException(400, "No credentials stored")

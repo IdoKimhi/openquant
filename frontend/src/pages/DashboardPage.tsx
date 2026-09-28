@@ -5,12 +5,15 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   PieChart, Pie, Cell
 } from 'recharts'
-import { format, formatDistanceToNow } from 'date-fns'
 import { dashboardApi, AccountSummary, Position, Order, EquityPoint, TradeLog, MarketClock } from '../api/dashboard'
+import { safeFormat, safeFormatDistance } from '../lib/format'
+import { useChartColors } from '../lib/chartColors'
 
-const COLORS = ['#3B82F6', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6', '#EC4899']
 
 export function DashboardPage() {
+  // Resolved from the active theme; see lib/chartColors.ts.
+  const chart = useChartColors()
+  const COLORS = chart.palette
   const [account, setAccount] = useState<AccountSummary | null>(null)
   const [positions, setPositions] = useState<Position[]>([])
   const [orders, setOrders] = useState<Order[]>([])
@@ -85,28 +88,16 @@ export function DashboardPage() {
     }).format(value)
   }
   
-  const getPnLColor = (value: number) => value >= 0 ? 'text-green-600' : 'text-red-600'
-  const getPnLBg = (value: number) => value >= 0 ? 'bg-green-50' : 'bg-red-50'
+  const getPnLColor = (value: number) => value >= 0 ? 'text-success-fg' : 'text-danger-fg'
+  const getPnLBg = (value: number) => value >= 0 ? 'bg-success-soft' : 'bg-danger-soft'
 
-  // date-fns throws RangeError on an invalid Date, which unmounts the whole
-  // page and leaves a blank screen. Format defensively so a missing or
-  // malformed timestamp can never take the dashboard down.
-  const safeFormat = (value: string | null | undefined, pattern: string) => {
-    const date = value ? new Date(value) : null
-    if (!date || Number.isNaN(date.getTime())) return '-'
-    return format(date, pattern)
-  }
+  // Every date below goes through safeFormat / safeFormatDistance from
+  // lib/format.ts, because a throw inside render unmounts the page.
 
-  const safeFormatDistance = (value: string | null | undefined) => {
-    const date = value ? new Date(value) : null
-    if (!date || Number.isNaN(date.getTime())) return '-'
-    return formatDistanceToNow(date, { addSuffix: true })
-  }
-  
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <Loader2 className="h-12 w-12 animate-spin text-blue-600" />
+        <Loader2 className="h-12 w-12 animate-spin text-accent" />
       </div>
     )
   }
@@ -116,8 +107,8 @@ export function DashboardPage() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900">Dashboard</h1>
-          <p className="mt-1 text-sm text-gray-500">Real-time account and trading overview</p>
+          <h1 className="text-2xl font-bold text-body">Dashboard</h1>
+          <p className="mt-1 text-sm text-muted">Real-time account and trading overview</p>
         </div>
         <button
           onClick={handleRefresh}
@@ -131,8 +122,8 @@ export function DashboardPage() {
       
       {/* Error Banner */}
       {error && (
-        <div className="bg-red-50 border border-red-200 rounded-lg p-4">
-          <div className="flex items-center text-red-800">
+        <div className="bg-danger-soft border border-line-danger rounded-lg p-4">
+          <div className="flex items-center text-danger-fg">
             <AlertCircle className="h-5 w-5 mr-2" />
             <span>{error}</span>
             <button onClick={handleRefresh} className="ml-auto text-sm underline">Retry</button>
@@ -143,18 +134,18 @@ export function DashboardPage() {
       {/* Market Status */}
       {marketClock && (
         <div className={`flex items-center gap-4 p-4 rounded-lg ${
-          marketClock.is_open ? 'bg-green-50 border border-green-200' : 'bg-gray-50 border border-gray-200'
+          marketClock.is_open ? 'bg-success-soft border border-line-success' : 'bg-canvas border border-line'
         }`}>
-          <div className={`flex items-center h-3 w-3 rounded-full ${marketClock.is_open ? 'bg-green-500 animate-pulse' : 'bg-gray-300'}`} />
-          <span className="font-medium text-gray-900">
+          <div className={`flex items-center h-3 w-3 rounded-full ${marketClock.is_open ? 'bg-success animate-pulse' : 'bg-line'}`} />
+          <span className="font-medium text-body">
             Market: {marketClock.is_open ? 'OPEN' : 'CLOSED'}
           </span>
-          <span className="text-sm text-gray-500">
+          <span className="text-sm text-muted">
             {marketClock.is_open
               ? `Closes at ${safeFormat(marketClock.next_close, 'h:mm a')}`
               : `Opens at ${safeFormat(marketClock.next_open, 'h:mm a')}`}
           </span>
-          <span className="text-xs text-gray-400 ml-auto">
+          <span className="text-xs text-subtle ml-auto">
             Updated: {safeFormatDistance(marketClock.timestamp)}
           </span>
         </div>
@@ -166,23 +157,11 @@ export function DashboardPage() {
           <div className="card">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-sm text-gray-500">Equity</p>
-                <p className="text-2xl font-bold text-gray-900">{formatCurrency(account.equity)}</p>
+                <p className="text-sm text-muted">Equity</p>
+                <p className="text-2xl font-bold text-body">{formatCurrency(account.equity)}</p>
               </div>
-              <div className="p-3 bg-blue-100 rounded-full">
-                <DollarSign className="h-6 w-6 text-blue-600" />
-              </div>
-            </div>
-          </div>
-          
-          <div className="card">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm text-gray-500">Cash</p>
-                <p className="text-2xl font-bold text-gray-900">{formatCurrency(account.cash)}</p>
-              </div>
-              <div className="p-3 bg-green-100 rounded-full">
-                <Wallet className="h-6 w-6 text-green-600" />
+              <div className="p-3 bg-accent-soft rounded-full">
+                <DollarSign className="h-6 w-6 text-accent" />
               </div>
             </div>
           </div>
@@ -190,11 +169,11 @@ export function DashboardPage() {
           <div className="card">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-sm text-gray-500">Buying Power</p>
-                <p className="text-2xl font-bold text-gray-900">{formatCurrency(account.buying_power)}</p>
+                <p className="text-sm text-muted">Cash</p>
+                <p className="text-2xl font-bold text-body">{formatCurrency(account.cash)}</p>
               </div>
-              <div className="p-3 bg-purple-100 rounded-full">
-                <CreditCard className="h-6 w-6 text-purple-600" />
+              <div className="p-3 bg-success-soft rounded-full">
+                <Wallet className="h-6 w-6 text-success-fg" />
               </div>
             </div>
           </div>
@@ -202,7 +181,19 @@ export function DashboardPage() {
           <div className="card">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-sm text-gray-500">Day P&L</p>
+                <p className="text-sm text-muted">Buying Power</p>
+                <p className="text-2xl font-bold text-body">{formatCurrency(account.buying_power)}</p>
+              </div>
+              <div className="p-3 bg-accent-soft rounded-full">
+                <CreditCard className="h-6 w-6 text-accent" />
+              </div>
+            </div>
+          </div>
+          
+          <div className="card">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm text-muted">Day P&L</p>
                 <p className={`text-2xl font-bold ${getPnLColor(account.day_pl)}`}>
                   {account.day_pl >= 0 ? '+' : ''}{formatCurrency(account.day_pl)}
                 </p>
@@ -217,7 +208,7 @@ export function DashboardPage() {
       
       {/* Tabs */}
       <div className="card">
-        <div className="border-b border-gray-200">
+        <div className="border-b border-line">
           <nav className="flex -mb-px" aria-label="Tabs">
             {[
               { id: 'overview', label: 'Overview', icon: Activity },
@@ -231,8 +222,8 @@ export function DashboardPage() {
                 onClick={() => setActiveTab(tab.id as any)}
                 className={`flex items-center px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
                   activeTab === tab.id
-                    ? 'border-blue-500 text-blue-600'
-                    : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+                    ? 'border-accent text-accent'
+                    : 'border-transparent text-muted hover:text-body hover:border-line-strong'
                 }`}
               >
                 <tab.icon className="h-4 w-4 mr-2" />
@@ -248,7 +239,7 @@ export function DashboardPage() {
               {/* Portfolio Allocation */}
               {positions.length > 0 && (
                 <div>
-                  <h3 className="text-lg font-medium text-gray-900 mb-4">Portfolio Allocation</h3>
+                  <h3 className="text-lg font-medium text-body mb-4">Portfolio Allocation</h3>
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                     <div className="h-64">
                       <ResponsiveContainer width="100%" height="100%">
@@ -262,7 +253,7 @@ export function DashboardPage() {
                             cy="50%"
                             innerRadius={60}
                             outerRadius={100}
-                            fill="#8884d8"
+                            fill={COLORS[0]}
                             paddingAngle={2}
                             dataKey="value"
                             label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}
@@ -277,19 +268,19 @@ export function DashboardPage() {
                     </div>
                     <div className="space-y-3">
                       {positions.map((pos, index) => (
-                        <div key={pos.symbol} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
+                        <div key={pos.symbol} className="flex items-center justify-between p-3 bg-canvas rounded-lg">
                           <div className="flex items-center">
                             <div className={`h-3 w-3 rounded-full mr-3`} style={{ backgroundColor: COLORS[index % COLORS.length] }} />
                             <div>
-                              <p className="font-medium text-gray-900">{pos.symbol}</p>
-                              <p className="text-sm text-gray-500">{pos.qty} shares @ ${formatNumber(pos.avg_entry_price)}</p>
+                              <p className="font-medium text-body">{pos.symbol}</p>
+                              <p className="text-sm text-muted">{pos.qty} shares @ ${formatNumber(pos.avg_entry_price)}</p>
                             </div>
                           </div>
                           <div className="text-right">
                             <p className={`font-medium ${getPnLColor(pos.unrealized_pl)}`}>
                               {pos.unrealized_pl >= 0 ? '+' : ''}{formatCurrency(pos.unrealized_pl)}
                             </p>
-                            <p className="text-sm text-gray-500">
+                            <p className="text-sm text-muted">
                               {pos.unrealized_plpc >= 0 ? '+' : ''}{formatNumber(pos.unrealized_plpc * 100)}%
                             </p>
                           </div>
@@ -302,19 +293,19 @@ export function DashboardPage() {
               
               {/* Quick Stats */}
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                <div className="p-4 bg-gray-50 rounded-lg">
-                  <p className="text-sm text-gray-500">Total P&L</p>
+                <div className="p-4 bg-canvas rounded-lg">
+                  <p className="text-sm text-muted">Total P&L</p>
                   <p className={`text-2xl font-bold ${getPnLColor(account.total_pl)}`}>
                     {account.total_pl >= 0 ? '+' : ''}{formatCurrency(account.total_pl)}
                   </p>
                 </div>
-                <div className="p-4 bg-gray-50 rounded-lg">
-                  <p className="text-sm text-gray-500">Portfolio Value</p>
-                  <p className="text-2xl font-bold text-gray-900">{formatCurrency(account.portfolio_value)}</p>
+                <div className="p-4 bg-canvas rounded-lg">
+                  <p className="text-sm text-muted">Portfolio Value</p>
+                  <p className="text-2xl font-bold text-body">{formatCurrency(account.portfolio_value)}</p>
                 </div>
-                <div className="p-4 bg-gray-50 rounded-lg">
-                  <p className="text-sm text-gray-500">Open Positions</p>
-                  <p className="text-2xl font-bold text-gray-900">{positions.length}</p>
+                <div className="p-4 bg-canvas rounded-lg">
+                  <p className="text-sm text-muted">Open Positions</p>
+                  <p className="text-2xl font-bold text-body">{positions.length}</p>
                 </div>
               </div>
             </div>
@@ -324,14 +315,14 @@ export function DashboardPage() {
             <div>
               {positions.length === 0 ? (
                 <div className="text-center py-12">
-                  <Wallet className="h-12 w-12 text-gray-300 mx-auto mb-4" />
-                  <p className="text-gray-500">No open positions</p>
+                  <Wallet className="h-12 w-12 text-subtle mx-auto mb-4" />
+                  <p className="text-muted">No open positions</p>
                 </div>
               ) : (
                 <div className="overflow-x-auto">
                   <table className="w-full">
                     <thead>
-                      <tr className="text-left text-sm text-gray-500 border-b border-gray-200">
+                      <tr className="text-left text-sm text-muted border-b border-line">
                         <th className="pb-3 font-medium">Symbol</th>
                         <th className="pb-3 font-medium">Qty</th>
                         <th className="pb-3 font-medium">Side</th>
@@ -342,19 +333,19 @@ export function DashboardPage() {
                         <th className="pb-3 font-medium">P&L %</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-gray-100">
+                    <tbody className="divide-y divide-line">
                       {positions.map(pos => (
-                        <tr key={pos.symbol} className="hover:bg-gray-50">
-                          <td className="py-3 font-medium text-gray-900">{pos.symbol}</td>
-                          <td className="py-3 text-gray-600">{pos.qty}</td>
+                        <tr key={pos.symbol} className="hover:bg-canvas">
+                          <td className="py-3 font-medium text-body">{pos.symbol}</td>
+                          <td className="py-3 text-muted">{pos.qty}</td>
                           <td className="py-3">
                             <span className={`badge ${pos.side === 'long' ? 'badge-success' : 'badge-danger'}`}>
                               {pos.side}
                             </span>
                           </td>
-                          <td className="py-3 text-gray-600">{formatCurrency(pos.avg_entry_price)}</td>
-                          <td className="py-3 text-gray-600">{formatCurrency(pos.current_price)}</td>
-                          <td className="py-3 font-medium text-gray-900">{formatCurrency(pos.market_value)}</td>
+                          <td className="py-3 text-muted">{formatCurrency(pos.avg_entry_price)}</td>
+                          <td className="py-3 text-muted">{formatCurrency(pos.current_price)}</td>
+                          <td className="py-3 font-medium text-body">{formatCurrency(pos.market_value)}</td>
                           <td className={`py-3 font-medium ${getPnLColor(pos.unrealized_pl)}`}>
                             {pos.unrealized_pl >= 0 ? '+' : ''}{formatCurrency(pos.unrealized_pl)}
                           </td>
@@ -374,14 +365,14 @@ export function DashboardPage() {
             <div>
               {orders.length === 0 ? (
                 <div className="text-center py-12">
-                  <CreditCard className="h-12 w-12 text-gray-300 mx-auto mb-4" />
-                  <p className="text-gray-500">No recent orders</p>
+                  <CreditCard className="h-12 w-12 text-subtle mx-auto mb-4" />
+                  <p className="text-muted">No recent orders</p>
                 </div>
               ) : (
                 <div className="overflow-x-auto">
                   <table className="w-full">
                     <thead>
-                      <tr className="text-left text-sm text-gray-500 border-b border-gray-200">
+                      <tr className="text-left text-sm text-muted border-b border-line">
                         <th className="pb-3 font-medium">Time</th>
                         <th className="pb-3 font-medium">Symbol</th>
                         <th className="pb-3 font-medium">Side</th>
@@ -391,21 +382,21 @@ export function DashboardPage() {
                         <th className="pb-3 font-medium">Status</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-gray-100">
+                    <tbody className="divide-y divide-line">
                       {orders.slice(0, 20).map(order => (
-                        <tr key={order.id} className="hover:bg-gray-50">
-                          <td className="py-3 text-sm text-gray-600">
+                        <tr key={order.id} className="hover:bg-canvas">
+                          <td className="py-3 text-sm text-muted">
                             {safeFormat(order.submitted_at, 'MMM d, h:mm a')}
                           </td>
-                          <td className="py-3 font-medium text-gray-900">{order.symbol}</td>
+                          <td className="py-3 font-medium text-body">{order.symbol}</td>
                           <td className="py-3">
                             <span className={`badge ${order.side === 'buy' ? 'badge-success' : 'badge-danger'}`}>
                               {order.side.toUpperCase()}
                             </span>
                           </td>
-                          <td className="py-3 text-gray-600 capitalize">{order.order_type}</td>
-                          <td className="py-3 text-gray-600">{order.qty}</td>
-                          <td className="py-3 text-gray-600">
+                          <td className="py-3 text-muted capitalize">{order.order_type}</td>
+                          <td className="py-3 text-muted">{order.qty}</td>
+                          <td className="py-3 text-muted">
                             {order.limit_price ? formatCurrency(order.limit_price) : 'Market'}
                           </td>
                           <td className="py-3">
@@ -432,25 +423,25 @@ export function DashboardPage() {
             <div>
               {equityCurve.length === 0 ? (
                 <div className="text-center py-12">
-                  <TrendingUp className="h-12 w-12 text-gray-300 mx-auto mb-4" />
-                  <p className="text-gray-500">No equity data yet</p>
-                  <p className="text-sm text-gray-400 mt-1">Equity curve will appear after the bot runs</p>
+                  <TrendingUp className="h-12 w-12 text-subtle mx-auto mb-4" />
+                  <p className="text-muted">No equity data yet</p>
+                  <p className="text-sm text-subtle mt-1">Equity curve will appear after the bot runs</p>
                 </div>
               ) : (
                 <div className="h-80">
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={equityCurve}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#E5E7EB" />
+                      <CartesianGrid strokeDasharray="3 3" stroke={chart.grid} />
                       <XAxis
                         dataKey="timestamp"
                         tickFormatter={value => safeFormat(value, 'MMM d')}
-                        tick={{ fill: '#6B7280', fontSize: 12 }}
-                        stroke="#E5E7EB"
+                        tick={{ fill: chart.tick, fontSize: 12 }}
+                        stroke={chart.grid}
                       />
                       <YAxis
                         tickFormatter={value => formatCurrency(value)}
-                        tick={{ fill: '#6B7280', fontSize: 12 }}
-                        stroke="#E5E7EB"
+                        tick={{ fill: chart.tick, fontSize: 12 }}
+                        stroke={chart.grid}
                       />
                       <Tooltip
                         formatter={(value: number) => [formatCurrency(value), 'Equity']}
@@ -459,7 +450,7 @@ export function DashboardPage() {
                       <Line
                         type="monotone"
                         dataKey="equity"
-                        stroke="#3B82F6"
+                        stroke={COLORS[0]}
                         strokeWidth={2}
                         dot={false}
                         activeDot={{ r: 6 }}
@@ -475,14 +466,14 @@ export function DashboardPage() {
             <div>
               {logs.length === 0 ? (
                 <div className="text-center py-12">
-                  <Activity className="h-12 w-12 text-gray-300 mx-auto mb-4" />
-                  <p className="text-gray-500">No trading activity yet</p>
+                  <Activity className="h-12 w-12 text-subtle mx-auto mb-4" />
+                  <p className="text-muted">No trading activity yet</p>
                 </div>
               ) : (
                 <div className="overflow-x-auto">
                   <table className="w-full">
                     <thead>
-                      <tr className="text-left text-sm text-gray-500 border-b border-gray-200">
+                      <tr className="text-left text-sm text-muted border-b border-line">
                         <th className="pb-3 font-medium">Time</th>
                         <th className="pb-3 font-medium">Symbol</th>
                         <th className="pb-3 font-medium">Side</th>
@@ -493,21 +484,21 @@ export function DashboardPage() {
                         <th className="pb-3 font-medium">Message</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-gray-100">
+                    <tbody className="divide-y divide-line">
                       {logs.map(log => (
-                        <tr key={log.id} className="hover:bg-gray-50">
-                          <td className="py-3 text-sm text-gray-600">
+                        <tr key={log.id} className="hover:bg-canvas">
+                          <td className="py-3 text-sm text-muted">
                             {safeFormat(log.timestamp, 'MMM d, h:mm:ss a')}
                           </td>
-                          <td className="py-3 font-medium text-gray-900">{log.symbol}</td>
+                          <td className="py-3 font-medium text-body">{log.symbol}</td>
                           <td className="py-3">
                             <span className={`badge ${log.side === 'buy' ? 'badge-success' : 'badge-danger'}`}>
                               {log.side.toUpperCase()}
                             </span>
                           </td>
-                          <td className="py-3 text-gray-600">{log.qty}</td>
-                          <td className="py-3 text-gray-600 capitalize">{log.order_type}</td>
-                          <td className="py-3 text-gray-600">
+                          <td className="py-3 text-muted">{log.qty}</td>
+                          <td className="py-3 text-muted capitalize">{log.order_type}</td>
+                          <td className="py-3 text-muted">
                             {log.limit_price ? formatCurrency(log.limit_price) : 'Market'}
                           </td>
                           <td className="py-3">
@@ -520,7 +511,7 @@ export function DashboardPage() {
                               {log.status}
                             </span>
                           </td>
-                          <td className="py-3 text-sm text-gray-600 max-w-xs truncate">{log.message}</td>
+                          <td className="py-3 text-sm text-muted max-w-xs truncate">{log.message}</td>
                         </tr>
                       ))}
                     </tbody>
