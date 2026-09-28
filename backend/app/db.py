@@ -1,7 +1,13 @@
+import logging
+import time
+
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker, declarative_base
 from app.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 # How long a writer waits for the SQLite write lock before giving up.
 #
@@ -150,10 +156,40 @@ def ensure_schema(engine: Engine | None = None) -> list[str]:
     return added
 
 
-def init_db():
-    engine = get_engine()
-    Base.metadata.create_all(bind=engine)
-    ensure_schema(engine)
+def init_db(attempts: int = 3, retry_delay_s: float = 0.5) -> list[str]:
+    """Create the schema and upgrade it in place. Safe to call from any process.
+
+    Called by *both* containers now, because the worker has its own engine and
+    its own connection pool and would otherwise keep querying a database that
+    only the backend had upgraded (see `ensure_schema`). That makes two
+    processes reach `create_all` at once, since `depends_on: service_started`
+    only waits for the container to spawn, not for the backend's startup hook to
+    finish.
+
+    `create_all(checkfirst=True)` is a read-then-create with no `IF NOT EXISTS`
+    behind it, so the loser of that race gets `table "x" already exists` and
+    dies on boot - which in practice means the worker crash-looping while the
+    backend finishes its own start. Retried, and *only* for that: a genuine
+    OperationalError (a corrupt file, a read-only mount, a full disk) is
+    re-raised immediately, because retrying it turns a clear startup failure
+    into a slow one whose message no longer matches the cause.
+
+    Returns the columns `ensure_schema` added, for the caller to log - which is
+    how a deploy that quietly added a column gets said out loud.
+    """
+    for attempt in range(attempts):
+        try:
+            engine = get_engine()
+            Base.metadata.create_all(bind=engine)
+            return ensure_schema(engine)
+        except OperationalError as e:
+            if "already exists" not in str(e).lower() or attempt == attempts - 1:
+                raise
+            logger.warning(
+                "Lost the schema creation race against another container, retrying: %s", e
+            )
+            time.sleep(retry_delay_s * (attempt + 1))
+    return []  # unreachable; the loop either returns or raises
 
 
 def reset_db():

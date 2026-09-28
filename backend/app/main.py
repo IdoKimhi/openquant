@@ -3,6 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.audit import AuditMiddleware
 from app.db import init_db
 from app.routes import auth, agent_keys, bot_config, credentials, dashboard, profiles
+import logging
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="OpenQuant Agent API", version="1.2.0")
 
@@ -34,7 +37,13 @@ app.include_router(agent_keys.router)
 
 @app.on_event("startup")
 async def startup():
-    init_db()
+    # Logged rather than discarded: `init_db` is the only upgrade path this
+    # project has (no Alembic environment - see app/db.py), so "column X added"
+    # is the one line in the logs that says a deploy actually changed the
+    # database. The worker logs the same thing from its own startup.
+    added = init_db()
+    if added:
+        logger.info("Added missing columns at startup: %s", ", ".join(added))
 
 
 @app.get("/health")

@@ -11,7 +11,7 @@ import signal
 import sys
 from datetime import datetime, timedelta
 
-from app.db import get_engine, get_session_local
+from app.db import get_engine, get_session_local, init_db
 from app.models import StrategyProfile, BotConfig, TradeLog, EquitySnapshot, OrderStatus
 from app.bot.engine import run_strategy
 from app.bot.market_hours import (
@@ -117,6 +117,22 @@ class BotWorker:
     """Main worker class that runs the trading bot on schedule"""
     
     def __init__(self):
+        # The worker owns its schema upgrade. It has its own engine and its own
+        # connection pool, and the backend's `init_db` - which is where the
+        # upgrade lived until this - runs in a different container against a
+        # different process. Relying on it means depending on a startup order
+        # nobody guarantees: `depends_on: service_started` waits for the
+        # container to spawn, not for the hook, and `docker compose restart
+        # worker` starts the worker with nothing else running. The failure is
+        # silent until the first query, then it is a crash loop on "no such
+        # column: bot_config.<something added this release>".
+        #
+        # `init_db` is idempotent and is now called by both processes, so this
+        # is two no-ops in the steady state, not two migrations.
+        added = init_db()
+        if added:
+            logger.info(f"Worker added missing columns on startup: {', '.join(added)}")
+
         self.scheduler = build_scheduler()
         self.db: Session = get_session_local()()
         self.running = False

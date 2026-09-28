@@ -18,9 +18,13 @@ import sqlite3
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import sessionmaker
 
-from app.db import build_engine, ensure_schema, get_engine
-from app.models import Base
+from app.db import build_engine, ensure_schema, get_engine, init_db
+from app.models import Base, BotConfig
+from worker import scheduler as worker_scheduler
+from worker.scheduler import BotWorker
 
 
 def old_shaped_db(path):
@@ -52,6 +56,24 @@ def old_shaped_db(path):
 def columns(engine, table):
     with engine.connect() as conn:
         return {row[1] for row in conn.execute(text(f'PRAGMA table_info("{table}")'))}
+
+
+def table_names(engine):
+    with engine.connect() as conn:
+        return {
+            row[0]
+            for row in conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))
+        }
+
+
+def sqlite_error(message):
+    """The OperationalError SQLAlchemy actually raises, `orig` and all.
+
+    Constructed rather than stringified because `init_db` matches on the
+    message; hand-rolling the exception would not exercise the same path a real
+    race takes through the driver.
+    """
+    return OperationalError("CREATE TABLE ...", {}, sqlite3.OperationalError(message))
 
 
 class TestEnsureSchemaUpgradesAnExistingFile:
@@ -135,3 +157,144 @@ class TestEnsureSchemaUpgradesAnExistingFile:
             "capital_allocation_pct has no server_default, so ensure_schema "
             "would add it as NULL and every existing row would break the cycle"
         )
+
+
+# The upgrade path is only half a fix if it runs in one of the two processes
+# that share the file. `init_db` is called from the backend's startup hook, and
+# the worker - a separate container, its own engine, its own connection pool -
+# never called it at all. So the deploy below did what the tests above say it
+# does: the backend's `/bot/config` served `capital_allocation_pct` correctly
+# while the worker crash-looped on `no such column: bot_config.
+# capital_allocation_pct`, raising before it ever scheduled a cycle.
+#
+# The worker cannot rely on the backend having upgraded first. `depends_on:
+# condition: service_started` only waits for the container to spawn; the backend
+# runs `init_db` from a startup hook, after that. And `docker compose restart
+# worker` on its own starts the worker with nothing else running at all.
+def bind_worker_to(path, monkeypatch):
+    """Point every database handle the worker has at `path`, and return the engine.
+
+    Two handles, not one. `init_db()` resolves the engine through `app.db`'s
+    module global, and `BotWorker` resolves its session through the name it
+    imported into `worker.scheduler`. Patching only the latter leaves the
+    upgrade running against the shared test database - where the column already
+    exists - so the test passes for the wrong reason.
+    """
+    engine = build_engine(f"sqlite:///{path}")
+    monkeypatch.setattr("app.db.get_engine", lambda: engine)
+    monkeypatch.setattr(
+        worker_scheduler, "get_session_local", lambda: sessionmaker(bind=engine)
+    )
+    # Signal handlers can only be installed on the main thread's, and replacing
+    # pytest's own SIGINT handler is a side effect no test needs.
+    monkeypatch.setattr(BotWorker, "_setup_signal_handlers", lambda self: None)
+    return engine
+
+
+class TestTheWorkerUpgradesTheSchemaItself:
+    def test_building_a_worker_brings_an_old_database_forward(self, tmp_path, monkeypatch):
+        """The exact deployment that produced the crash loop.
+
+        Built against a file in the pre-`capital_allocation_pct` shape, with
+        nothing else having touched it - no backend startup hook in the loop,
+        because there is not one to wait for.
+        """
+        path = str(tmp_path / "bot.db")
+        old_shaped_db(path)
+        engine = bind_worker_to(path, monkeypatch)
+
+        BotWorker()  # must not raise
+
+        assert "capital_allocation_pct" in columns(engine, "bot_config")
+
+    def test_a_fresh_worker_can_query_bot_config_on_an_old_file(self, tmp_path, monkeypatch):
+        """Construction succeeding is not the bar; the first real query is.
+
+        `start()` reads `BotConfig` before it schedules anything, which is where
+        the OperationalError surfaced in production - and a construction-only
+        check passes even with a null engine, since nothing has been queried.
+        """
+        path = str(tmp_path / "bot.db")
+        old_shaped_db(path)
+        bind_worker_to(path, monkeypatch)
+
+        worker = BotWorker()
+        config = worker.db.query(BotConfig).first()
+        assert config is not None
+        # The column the crash named, read as the ORM type the cycle uses.
+        assert config.capital_allocation_pct == pytest.approx(1.0)
+
+    def test_the_worker_creates_tables_on_an_empty_database(self, tmp_path, monkeypatch):
+        """The other half: an empty file has nothing to ALTER.
+
+        `ensure_schema` deliberately skips tables that do not exist - creating
+        them is `create_all`'s job - so a worker started against a brand-new
+        volume has to run the create too, or it dies on `no such table`.
+        """
+        path = str(tmp_path / "empty.db")
+        engine = bind_worker_to(path, monkeypatch)
+
+        BotWorker()
+
+        assert {"bot_config", "strategy_profiles", "trade_logs"} <= table_names(engine)
+
+
+class TestTwoContainersStartingAtOnce:
+    def test_init_db_survives_losing_the_create_all_race(self, tmp_path, monkeypatch):
+        """Both containers call `init_db` now, and nothing orders them.
+
+        `depends_on: service_started` waits for the container, not for the
+        startup hook that calls `init_db`, so both processes can reach
+        `create_all` together. `create_all(checkfirst=True)` is a
+        read-then-create and has no `IF NOT EXISTS` behind it, so the loser gets
+        `OperationalError: table "bot_config" already exists` and dies on
+        startup.
+
+        That is not hypothetical either: the worker crash-looped, and Docker
+        restarted it repeatedly while the backend was still finishing its own
+        boot.
+        """
+        path = str(tmp_path / "race.db")
+        engine = build_engine(f"sqlite:///{path}")
+        monkeypatch.setattr("app.db.get_engine", lambda: engine)
+
+        real_create_all = Base.metadata.create_all
+        calls = {"n": 0}
+
+        def racing_create_all(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # Exactly what the loser of the race sees, before the winner
+                # has committed and the table is actually visible to it.
+                raise sqlite_error('table "bot_config" already exists')
+            return real_create_all(*args, **kwargs)
+
+        monkeypatch.setattr(Base.metadata, "create_all", racing_create_all)
+
+        init_db()
+
+        assert calls["n"] > 1, "init_db gave up instead of retrying"
+        assert "bot_config" in table_names(engine)
+
+    def test_init_db_still_raises_on_an_error_that_is_not_the_race(self, tmp_path, monkeypatch):
+        """The retry must be narrow.
+
+        Swallowing and retrying every OperationalError turns a genuine
+        corruption or permissions problem into a slow, confusing hang, and the
+        eventual message no longer matches the cause.
+        """
+        path = str(tmp_path / "broken.db")
+        engine = build_engine(f"sqlite:///{path}")
+        monkeypatch.setattr("app.db.get_engine", lambda: engine)
+
+        attempts = {"n": 0}
+
+        def always_disk_io_error(*args, **kwargs):
+            attempts["n"] += 1
+            raise sqlite_error("disk I/O error")
+
+        monkeypatch.setattr(Base.metadata, "create_all", always_disk_io_error)
+
+        with pytest.raises(OperationalError, match="disk I/O error"):
+            init_db()
+        assert attempts["n"] == 1, "an unrelated OperationalError was retried"
