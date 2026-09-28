@@ -15,14 +15,24 @@ const scheduleSchema = z.object({
 
 type ScheduleForm = z.infer<typeof scheduleSchema>
 
-const cronPresets = [
-  { value: '*/5 9-16 * * MON-FRI', label: 'Every 5 min during market hours (9:30-16:00 ET, Mon-Fri)' },
-  { value: '*/15 9-16 * * MON-FRI', label: 'Every 15 min during market hours' },
-  { value: '*/30 9-16 * * MON-FRI', label: 'Every 30 min during market hours' },
-  { value: '0 9-16 * * MON-FRI', label: 'Hourly during market hours' },
-  { value: '0 9 * * MON-FRI', label: 'Daily at market open (9:30 ET)' },
-  { value: '0 16 * * MON-FRI', label: 'Daily at market close (16:00 ET)' }
-]
+/**
+ * Turn an IANA zone into something readable in a sentence.
+ *
+ * "America/New_York" -> "New York". Deliberately not a hardcoded ET/UTC
+ * lookup: the zone is the backend's BOT_TIMEZONE, so anything this page
+ * prints about it has to come from the value rather than from an assumption
+ * about what it usually is.
+ */
+function zoneLabel(tz: string): string {
+  const city = tz.split('/').pop() ?? tz
+  return city.replace(/_/g, ' ')
+}
+
+// The presets below are US equity session times. If the deployment runs on a
+// different zone they are still valid cron - they just no longer mean "during
+// market hours", which is worth saying out loud rather than leaving the
+// operator to work out that "9-16" is now somebody else's trading day.
+const US_MARKET_TZ = 'America/New_York'
 
 export function SchedulePage() {
   const [config, setConfig] = useState<BotConfig | null>(null)
@@ -125,6 +135,25 @@ export function SchedulePage() {
   }
   
   const currentCronDesc = config ? parseCron(config.schedule_cron) : ''
+
+  // Rendered from the API, not asserted here. This page previously printed
+  // "Timezone: UTC" while the worker ran on America/New_York, so a schedule
+  // written against the label fired four hours off - the exact bug the
+  // timezone tests exist for, in the one place a user reads the label.
+  const tz = config?.cron_timezone ?? US_MARKET_TZ
+  const tzName = zoneLabel(tz)
+  const onMarketTz = tz === US_MARKET_TZ
+
+  // Built from tzName rather than hardcoded "ET", so the preset labels cannot
+  // drift away from the zone the worker is actually using.
+  const cronPresets = [
+    { value: '*/5 9-16 * * MON-FRI', label: `Every 5 min during market hours (9:30-16:00 ${tzName}, Mon-Fri)` },
+    { value: '*/15 9-16 * * MON-FRI', label: 'Every 15 min during market hours' },
+    { value: '*/30 9-16 * * MON-FRI', label: 'Every 30 min during market hours' },
+    { value: '0 9-16 * * MON-FRI', label: 'Hourly during market hours' },
+    { value: '0 9 * * MON-FRI', label: `Daily at market open (9:30 ${tzName})` },
+    { value: '0 16 * * MON-FRI', label: `Daily at market close (16:00 ${tzName})` }
+  ]
   
   return (
     <div className="max-w-2xl mx-auto space-y-6">
@@ -143,7 +172,16 @@ export function SchedulePage() {
             <div>
               <dt className="text-muted">Schedule</dt>
               <dd className="font-mono text-body">{config.schedule_cron}</dd>
-              <dd className="text-muted mt-1">{currentCronDesc}</dd>
+              <dd className="text-muted mt-1">
+                {currentCronDesc} <span className="text-subtle">({tzName})</span>
+              </dd>
+            </div>
+            <div>
+              <dt className="text-muted">Cron Timezone</dt>
+              <dd className="font-mono text-body">{tz}</dd>
+              <dd className="text-muted mt-1">
+                Set by <code className="font-mono">BOT_TIMEZONE</code> on the server
+              </dd>
             </div>
             <div>
               <dt className="text-muted">Market Hours Only</dt>
@@ -236,8 +274,17 @@ export function SchedulePage() {
               <p className="mt-1 text-xs text-muted">
                 Uses standard cron format: minute hour day-of-month month day-of-week
                 <br />
-                Timezone: UTC (Alpaca uses ET for market hours)
+                Times below are <span className="font-medium text-body">{tzName}</span>{' '}
+                <span className="font-mono">({tz})</span>, not UTC
               </p>
+              {!onMarketTz && (
+                <p className="mt-2 p-2 rounded-md text-xs bg-danger-soft border border-line-danger text-danger-fg">
+                  This server's <code className="font-mono">BOT_TIMEZONE</code> is{' '}
+                  <code className="font-mono">{tz}</code>, not the US market timezone.
+                  The presets below still fire at 9:00-16:00 local, which is no longer
+                  the US trading session.
+                </p>
+              )}
             </div>
           </div>
           
@@ -247,7 +294,17 @@ export function SchedulePage() {
               <div>
                 <label className="label">Market Hours Only</label>
                 <p className="text-sm text-muted">
-                  Only run during US market hours (9:30 AM - 4:00 PM ET, Mon-Fri)
+                  Restrict the trading cycle to the regular US session
+                  (9:30 AM - 4:00 PM ET, Mon-Fri).
+                </p>
+                {/* This toggle is stored and displayed but the worker never
+                    reads it - the cycle gates on Alpaca's market clock
+                    unconditionally. Unchecking it currently does nothing, so
+                    the control says so rather than implying extended-hours
+                    trading is available. */}
+                <p className="mt-1 text-xs text-subtle">
+                  Not enforced yet: the cycle always checks the broker's market
+                  clock, so unchecking this does not enable extended hours.
                 </p>
               </div>
               <button
@@ -324,7 +381,7 @@ export function SchedulePage() {
             </thead>
             <tbody className="text-body divide-y divide-line">
               <tr><td className="py-2 font-mono">Minute</td><td className="py-2">0-59</td><td className="py-2">*, */n, n-m</td></tr>
-              <tr><td className="py-2 font-mono">Hour</td><td className="py-2">0-23 (UTC)</td><td className="py-2">*, */n, n-m</td></tr>
+              <tr><td className="py-2 font-mono">Hour</td><td className="py-2">0-23 ({tzName})</td><td className="py-2">*, */n, n-m</td></tr>
               <tr><td className="py-2 font-mono">Day of Month</td><td className="py-2">1-31</td><td className="py-2">*, ?, L, W</td></tr>
               <tr><td className="py-2 font-mono">Month</td><td className="py-2">1-12 or JAN-DEC</td><td className="py-2">*, */n</td></tr>
               <tr><td className="py-2 font-mono">Day of Week</td><td className="py-2">0-7 (0 or 7 = Sun) or MON-SUN</td><td className="py-2">*, ?, L, #</td></tr>
@@ -332,7 +389,8 @@ export function SchedulePage() {
           </table>
         </div>
         <p className="mt-3 text-xs text-muted">
-          Example: <code className="font-mono bg-line px-1 rounded">*/5 9-16 * * MON-FRI</code> = Every 5 minutes, 9AM-4PM UTC, Monday-Friday
+          Example: <code className="font-mono bg-line px-1 rounded">*/5 9-16 * * MON-FRI</code>{' '}
+          = Every 5 minutes, 9am-4pm {tzName}, Monday-Friday
         </p>
       </div>
     </div>

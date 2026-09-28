@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.db import get_db
-from app.models import TradeLog, EquitySnapshot, ApiCredentials, BotConfig
+from app.models import AuditLog, TradeLog, EquitySnapshot, ApiCredentials, BotConfig
 from app.schemas import (
-    AccountResponse, PositionResponse, OrderResponse, EquityPoint,
+    AccountResponse, AuditLogResponse, PositionResponse, OrderResponse, EquityPoint,
     TradeLogResponse, MarketClockResponse
 )
 from app.alpaca_client import AlpacaClient
@@ -11,6 +11,10 @@ from app.security import decrypt
 from app.authz import SCOPE_READ, require_scope
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
+
+# Cap on /dashboard/audit-log, because it is the one endpoint here whose
+# result set a caller controls the size of.
+AUDIT_LOG_MAX_LIMIT = 500
 
 
 def get_alpaca_client(db: Session) -> AlpacaClient | None:
@@ -21,7 +25,7 @@ def get_alpaca_client(db: Session) -> AlpacaClient | None:
 
 
 @router.get("/account", response_model=AccountResponse)
-async def get_account(user=Depends(require_scope(SCOPE_READ)), db: Session = Depends(get_db)):
+async def get_account(principal=Depends(require_scope(SCOPE_READ)), db: Session = Depends(get_db)):
     client = get_alpaca_client(db)
     if not client:
         raise HTTPException(400, "No credentials stored")
@@ -41,7 +45,7 @@ async def get_account(user=Depends(require_scope(SCOPE_READ)), db: Session = Dep
 
 
 @router.get("/positions", response_model=list[PositionResponse])
-async def get_positions(user=Depends(require_scope(SCOPE_READ)), db: Session = Depends(get_db)):
+async def get_positions(principal=Depends(require_scope(SCOPE_READ)), db: Session = Depends(get_db)):
     client = get_alpaca_client(db)
     if not client:
         raise HTTPException(400, "No credentials stored")
@@ -64,7 +68,7 @@ async def get_positions(user=Depends(require_scope(SCOPE_READ)), db: Session = D
 
 
 @router.get("/orders", response_model=list[OrderResponse])
-async def get_orders(user=Depends(require_scope(SCOPE_READ)), db: Session = Depends(get_db)):
+async def get_orders(principal=Depends(require_scope(SCOPE_READ)), db: Session = Depends(get_db)):
     client = get_alpaca_client(db)
     if not client:
         raise HTTPException(400, "No credentials stored")
@@ -93,7 +97,7 @@ async def get_orders(user=Depends(require_scope(SCOPE_READ)), db: Session = Depe
 
 
 @router.get("/equity-curve", response_model=list[EquityPoint])
-def get_equity_curve(user=Depends(require_scope(SCOPE_READ)), db: Session = Depends(get_db)):
+def get_equity_curve(principal=Depends(require_scope(SCOPE_READ)), db: Session = Depends(get_db)):
     # Get last 30 days of equity snapshots
     from datetime import datetime, timedelta
     cutoff = datetime.utcnow() - timedelta(days=30)
@@ -109,7 +113,7 @@ def get_equity_curve(user=Depends(require_scope(SCOPE_READ)), db: Session = Depe
 
 @router.get("/logs", response_model=list[TradeLogResponse])
 def get_logs(
-    user=Depends(require_scope(SCOPE_READ)), 
+    principal=Depends(require_scope(SCOPE_READ)), 
     db: Session = Depends(get_db),
     limit: int = 100,
     profile_id: int | None = None
@@ -120,8 +124,33 @@ def get_logs(
     return query.all()
 
 
+@router.get("/audit-log", response_model=list[AuditLogResponse])
+def get_audit_log(
+    principal=Depends(require_scope(SCOPE_READ)),
+    db: Session = Depends(get_db),
+    limit: int = 100,
+    actor: str | None = None,
+):
+    """Who changed what, newest first.
+
+    Scoped `read`, the same as every other dashboard read: seeing the account
+    implies seeing who moved the bot. Audit visibility is not a separate
+    permission, because a permission that lets a monitoring agent watch the
+    account but not watch the account's operators is not a permission anyone
+    wants.
+    """
+    query = db.query(AuditLog)
+    if actor:
+        # "user" | "agent" | "anonymous". Not validated: an unknown value
+        # returns an empty list, which is the right answer for a filter.
+        query = query.filter(AuditLog.actor_kind == actor)
+    return query.order_by(AuditLog.created_at.desc(), AuditLog.id.desc()).limit(
+        max(1, min(limit, AUDIT_LOG_MAX_LIMIT))
+    ).all()
+
+
 @router.get("/market-clock", response_model=MarketClockResponse)
-async def get_market_clock(user=Depends(require_scope(SCOPE_READ)), db: Session = Depends(get_db)):
+async def get_market_clock(principal=Depends(require_scope(SCOPE_READ)), db: Session = Depends(get_db)):
     client = get_alpaca_client(db)
     if not client:
         raise HTTPException(400, "No credentials stored")

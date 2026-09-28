@@ -227,6 +227,25 @@ def test_scope_catalogue_lists_every_scope():
         assert scope["label"] and scope["description"] and scope["danger"]
 
 
+def test_scope_catalogue_publishes_the_rate_limits():
+    """Whoever hands out a key is the one who needs to know what it will be
+    able to do per minute. An integrator finding out through a 429 is too late
+    to design around, and the UI cannot show a number the backend does not
+    publish."""
+    from app.authz import rate_limiter
+
+    body = client.get("/agent-keys/scopes", headers=admin_headers()).json()
+    limits = body["rate_limits"]
+    assert limits["read_limit"] > 0
+    assert limits["write_limit"] > 0
+    assert limits["write_limit"] < limits["read_limit"], (
+        "start/stop and reconfiguration must be harder to spam than a poll"
+    )
+    assert limits["window_seconds"] == int(rate_limiter.window)
+    assert limits["read_limit"] == rate_limiter.read_limit
+    assert limits["write_limit"] == rate_limiter.write_limit
+
+
 # --- Human-only boundaries -------------------------------------------------
 
 def test_agent_key_cannot_manage_agent_keys(agent):

@@ -32,6 +32,14 @@ export interface AgentKeyCreated extends AgentKey {
   key: string
 }
 
+/** Mirrors AgentRateLimits. The budgets a new key will actually be held to. */
+export interface AgentRateLimits {
+  requests_per_window: number
+  window_seconds: number
+  read_limit: number
+  write_limit: number
+}
+
 export interface AgentKeyCreate {
   label: string
   scopes: Scope[]
@@ -39,7 +47,7 @@ export interface AgentKeyCreate {
 
 export const agentKeysApi = {
   list: () => api.get<AgentKey[]>('/agent-keys'),
-  scopes: () => api.get<{ scopes: ScopeInfo[] }>('/agent-keys/scopes'),
+  scopes: () => api.get<{ scopes: ScopeInfo[]; rate_limits: AgentRateLimits }>('/agent-keys/scopes'),
   create: (data: AgentKeyCreate) => api.post<AgentKeyCreated>('/agent-keys', data),
   revoke: (id: number) => api.delete(`/agent-keys/${id}`),
 }

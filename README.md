@@ -101,11 +101,59 @@ Regardless of scopes, an agent key is refused by:
 Keys look like `oq_<43 chars>`. Only a SHA-256 hash is stored, so the plaintext is shown once at
 creation and cannot be recovered - if you lose it, revoke the key and create another. Revoking
 is immediate and takes effect on the next request; the key stays listed, marked revoked, so you
-can still see it existed. `last_used_at` tells you whether a key is actually in use.
+can still see it existed. `last_used_at` tells you whether a key is actually in use; it is
+updated at most once a minute, so a gap of up to a minute before a key shows as used is
+expected and not a sign of a problem.
 
 The admin session is a separate principal: an agent key presented to a human-only route gets
 `403`, and a missing `Authorization` header also gets `403` (not `401`) - the detail string is
 what distinguishes them.
+
+### Rate limits
+
+Every agent key gets its own independent budget. Exceeding it returns `429` with a
+`Retry-After` header and a detail naming the key, so a throttled agent can tell that apart
+from a rejected one.
+
+| Method | Default budget |
+|--------|----------------|
+| `GET`, `HEAD`, `OPTIONS` | 120 per minute |
+| `POST`, `PATCH`, `PUT`, `DELETE` | 20 per minute |
+
+Reads are cheap because a monitoring agent is mostly reads; start/stop and
+reconfiguration are not, and get a much tighter leash. Tune with `AGENT_READ_RATE_LIMIT`
+and `AGENT_WRITE_RATE_LIMIT`. The current values are shown on the Agents page, so whoever
+writes the agent can design against them rather than discovering them through a `429`.
+
+**Your own admin session is not rate limited.** One human in one browser is not the threat
+model, and a limiter that can lock the owner out of their own bot is the worse failure.
+
+One caveat worth stating: the counters live in the backend process's memory, which is exact
+for this single-container deployment and *not* correct if you ever put more than one backend
+replica behind a load balancer.
+
+### Audit log
+
+Every state-changing call is recorded in an `audit_log` row: who made it, which key, what it
+was, and the status code. Reads are deliberately not recorded - the dashboard polls on an
+interval, and a trail full of polls is a trail nobody reads.
+
+```
+GET /dashboard/audit-log?limit=50          # newest first
+GET /dashboard/audit-log?actor=agent      # or user, or anonymous
+```
+
+Two things it is built to make possible:
+
+- **A refused attempt is a row.** A key without `bot:kill` calling the kill switch gets a
+  `403` and an entry saying so. The route never ran, so nothing downstream would have logged
+  it - and that is usually the attempt you want to see.
+- **It outlives the key.** Revocation stops a key working but does not erase what it did, so
+  the record stays attributable to the label it was issued under.
+
+Request bodies are never captured. A route that wants detail calls
+`audit.record_summary(request, ...)` with what it actually changed - this is what keeps the
+Alpaca secret key from being written to a table that any `read` key can fetch back.
 
 ## Themes
 
@@ -218,6 +266,7 @@ openquant/
 - `GET /api/dashboard/equity-curve` - Equity time series
 - `GET /api/dashboard/logs` - Trade logs
 - `GET /api/dashboard/market-clock` - Market status
+- `GET /api/dashboard/audit-log` - State-changing calls: actor, key, action, status
 
 ## Strategies
 
@@ -239,6 +288,11 @@ openquant/
 - Encryption key derived from `SECRET_ENCRYPTION_KEY` environment variable
 - JWT-based authentication with bcrypt password hashing
 - Agent keys stored as SHA-256 hashes, shown once, individually revocable, read-only by default
+- Every state-changing call is audited, and the audit trail outlives the key that wrote it
+- Request bodies are never logged, so credential material cannot reach the audit table
+- Agent keys are rate limited per key; the admin session is not
+- A rate-limited request performs no database write, so a throttled agent cannot
+  lock the trading cycle out of its own database
 - `/credentials` and `/agent-keys` are unreachable by an agent key
 - Paper trading endpoint hardcoded - no live trading possible
 - No secrets in logs or source code

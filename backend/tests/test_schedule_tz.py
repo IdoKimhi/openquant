@@ -10,8 +10,18 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from apscheduler.triggers.cron import CronTrigger
+from fastapi.testclient import TestClient
 
+from app.config import get_settings
+from app.main import app
 from worker.scheduler import build_scheduler, MARKET_TZ
+
+client = TestClient(app)
+
+
+def admin_headers():
+    resp = client.post("/auth/login", json={"password": "testpass"})
+    return {"Authorization": f"Bearer {resp.json()['token']}"}
 
 
 class TestScheduleTimezone:
@@ -84,3 +94,47 @@ class TestScheduleTimezone:
         )
         # Every fire in the session must sit inside regular trading hours
         assert all(9 <= f.hour <= 16 for f in day)
+
+
+class TestApiReportsTheTimezoneTheWorkerUses:
+    """The Schedule page said "Timezone: UTC" and labelled the hour row
+    "0-23 (UTC)".
+
+    That was true of APScheduler's default and false of this app, which pins
+    MARKET_TZ - so a cron written against the UI's stated timezone fired
+    05:00-12:00 ET, which is the bug this file is about one layer up. It was
+    invisible in the UI because the schedule *looked* configured correctly.
+
+    Hardcoding "ET" in the frontend would not be a fix either: BOT_TIMEZONE is
+    configurable, so the only value that cannot be wrong is the one the worker
+    actually reads. Hence it is served.
+    """
+
+    def test_bot_config_reports_the_scheduler_timezone(self):
+        resp = client.get("/bot/config", headers=admin_headers())
+        assert resp.status_code == 200
+        assert resp.json()["cron_timezone"] == str(MARKET_TZ)
+
+    def test_the_reported_value_is_the_one_the_trigger_is_built_with(self):
+        """Not just "a plausible-looking zone" - the same string the worker
+        hands to CronTrigger. If these drift, the UI is confidently wrong."""
+        reported = client.get("/bot/config", headers=admin_headers()).json()["cron_timezone"]
+        assert reported == get_settings().bot_timezone
+        assert ZoneInfo(reported) == MARKET_TZ
+
+    def test_the_reported_value_is_a_resolvable_iana_zone(self):
+        """A typo in BOT_TIMEZONE must not render as a plausible string in the
+        UI while the worker blows up on every cycle."""
+        reported = client.get("/bot/config", headers=admin_headers()).json()["cron_timezone"]
+        assert "/" in reported
+        assert ZoneInfo(reported) is not None
+
+    def test_the_patch_response_reports_it_too(self):
+        """SchedulePage reloads after saving. If only GET carried the field,
+        the timezone would vanish from the screen the moment anyone edited
+        the schedule."""
+        resp = client.patch(
+            "/bot/config", json={"market_hours_only": True}, headers=admin_headers()
+        )
+        assert resp.status_code == 200
+        assert resp.json()["cron_timezone"] == str(MARKET_TZ)

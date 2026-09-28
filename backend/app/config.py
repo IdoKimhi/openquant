@@ -17,6 +17,16 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expire_hours: int = 24
 
+    # Per-minute request budget for agent keys. Writes get a much smaller one
+    # than reads: reads are what a monitoring agent is for, while start/stop
+    # and reconfiguration are worth a tighter leash than a dashboard poll.
+    #
+    # The admin session is deliberately NOT limited. It is one human in one
+    # browser, so it is not the threat model, and a limiter that can lock the
+    # owner out of their own bot is a worse failure than the abuse it stops.
+    agent_read_rate_limit: int = 120
+    agent_write_rate_limit: int = 20
+
     class Config:
         env_file = ".env"
 

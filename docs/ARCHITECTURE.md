@@ -130,6 +130,37 @@ routes.
 - There is no agent-facing order-placement endpoint. An agent can reconfigure a bot which
   places orders, but cannot itself place one.
 
+### Rate limiting
+Agent keys are long-lived bearer tokens, so they need a brake the admin credential does not.
+
+- Fixed-window counters in the backend process, keyed on the **resolved key id**. Keying on the
+  token or its prefix would let anyone who knows a prefix starve a real key by guessing under
+  it.
+- Windows are **aligned to the clock**, not opened on a client's first request, so a caller
+  straddling a boundary cannot get two budgets.
+- Defaults: 120 reads and 20 writes per minute (`AGENT_READ_RATE_LIMIT`,
+  `AGENT_WRITE_RATE_LIMIT`). Over budget is `429` with `Retry-After`.
+- **The admin session is not limited.** One human in one browser is not the threat model.
+- State is per process: exact for one replica, incorrect behind a load balancer with two. That
+  case would need the shared SQLite volume, not a second in-memory copy.
+
+### Audit trail
+Once an agent can move the bot, "was that the human or the agent" stops being obvious, and
+`last_used_at` cannot answer it - it records that a key was *presented*, not what it did, and
+stops recording the moment the key is revoked.
+
+- `app/audit.py` middleware writes one row per state-changing request. Reads are not recorded:
+  the dashboard polls, and a trail of polls is a trail nobody reads.
+- The actor comes from `request.state`, which `get_current_principal` sets on success. A
+  request that never authenticated is recorded as `anonymous` - which includes refused and
+  expired-token attempts, the ones worth seeing.
+- **Request bodies are never captured.** A route opts in to detail via
+  `audit.record_summary(request, ...)`, which is what keeps the Alpaca secret key out of a
+  table any `read` key can fetch back.
+- A failed audit write is logged and swallowed. The action has already been applied; failing
+  the request would turn a logging fault into a trading fault.
+- Readable at `GET /dashboard/audit-log` (scope `read`), filterable by actor.
+
 ### Network
 - Paper trading endpoint hardcoded (`https://paper-api.alpaca.markets`)
 - No live trading possible by design
@@ -140,6 +171,7 @@ routes.
 ### Tables
 - `api_credentials` - Encrypted Alpaca API keys
 - `agent_keys` - Scoped agent credentials (label, key prefix, key hash, scopes, revoked_at)
+- `audit_log` - State-changing API calls: actor kind/label, key id, method, path, action, status
 - `strategy_profiles` - Strategy configurations with risk params
 - `bot_config` - Global bot settings (schedule, active profile)
 - `trade_logs` - All executed trades with PnL
@@ -149,6 +181,20 @@ routes.
 - `BotConfig.active_profile_id` → `StrategyProfile.id` (FK)
 - `TradeLog.profile_id` → `StrategyProfile.id` (FK, nullable)
 - `agent_keys` has no FKs; it is a standalone credential
+- `audit_log.key_id` is a plain integer, not a FK. It deliberately survives the key it refers
+  to being revoked, and a FK would make the trail's whole purpose impossible.
+
+### Connection settings
+The backend and the worker are separate containers sharing one SQLite file, so they contend by
+default: the rollback journal takes a whole-database lock for the duration of any write, meaning
+the worker's trade-log inserts and the backend's dashboard reads block each other. `build_engine()`
+in `app/db.py` sets **WAL** (readers proceed during a write) and a **15s busy timeout** (contention
+waits rather than raising). WAL is persistent in the file, so it is set once per engine;
+`busy_timeout` is per-connection, so it goes in `connect_args`.
+
+One consequence worth knowing: SQLite serialises writers, so any code path that writes on a read
+request is expensive. `AgentKey.last_used_at` is stamped at most once a minute per key for exactly
+this reason - see `AGENTS.md` gotcha 18.
 
 ### Column typing at the broker boundary
 `trade_logs.status` and `alpaca_order_id` are free text (`String`), not enums, and the
@@ -184,6 +230,8 @@ All configured via `.env` file:
 - `JWT_SECRET` - JWT signing secret
 - `BOT_SCHEDULE_CRON` - APScheduler cron expression (evaluated in `BOT_TIMEZONE`)
 - `BOT_TIMEZONE` - IANA timezone for the cron expression (default: `America/New_York`)
+- `AGENT_READ_RATE_LIMIT` - Agent key reads per minute (default: `120`)
+- `AGENT_WRITE_RATE_LIMIT` - Agent key writes per minute (default: `20`)
 
 ### Startup
 ```bash
@@ -222,7 +270,7 @@ docker compose up --build
 | API credentials invalid | Test connection endpoint, worker logs error |
 | Daily loss exceeded | Kill-switch triggers, cancels all orders |
 | Position limit reached | RiskManager blocks new buy orders |
-| Database locked | SQLite WAL mode, connection pooling |
+| Database locked | WAL mode + 15s busy timeout, set in `app/db.py` (see below) |
 | Worker crash | APScheduler coalesce=True, max_instances=1 |
 | Config change | Worker polls every 30s, updates schedule dynamically |
 

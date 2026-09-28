@@ -1,9 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from app.audit import AuditMiddleware
 from app.db import init_db
 from app.routes import auth, agent_keys, bot_config, credentials, dashboard, profiles
 
-app = FastAPI(title="OpenQuant Agent API", version="1.1.0")
+app = FastAPI(title="OpenQuant Agent API", version="1.2.0")
 
 # CORS for frontend
 app.add_middleware(
@@ -13,6 +14,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Added last, so it is the *outermost* middleware and therefore sees the final
+# status code after FastAPI has turned a raised HTTPException into a response.
+# That is what makes a 403 auditable: the route never ran, so nothing
+# downstream logged the refusal.
+app.add_middleware(AuditMiddleware)
 
 # Include routers
 app.include_router(auth.router)

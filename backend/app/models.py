@@ -84,6 +84,41 @@ class AgentKey(Base):
         return self.revoked_at is None
 
 
+class AuditLog(Base):
+    """One row per state-changing API call, whoever made it.
+
+    `AgentKey.last_used_at` cannot answer "did an agent start the bot?" - it
+    only records that a key was presented - and it stops recording the moment
+    the key is revoked, which is exactly when the question gets asked. This is
+    the record that survives revocation.
+
+    Deliberately narrow. Reads are not recorded (the dashboard polls on an
+    interval, and burying actions under noise makes the trail useless), and
+    request bodies are not captured: `detail` is written only by a route that
+    opts in via `audit.record_summary`, so a body-capturing trail cannot end
+    up writing the Alpaca secret key to a table the `read` scope can read.
+    """
+    __tablename__ = "audit_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    # "user" | "agent" | "anonymous". Anonymous is not a third kind of caller
+    # so much as "we could not attribute this" - a missing header, or a token
+    # that failed to authenticate. A refused or unauthenticated attempt is
+    # still worth a row, since the route never ran and logged nothing itself.
+    actor_kind = Column(String, nullable=False)
+    actor_label = Column(String, nullable=True)
+    key_id = Column(Integer, nullable=True)
+    method = Column(String, nullable=False)
+    path = Column(String, nullable=False)
+    # Route template ("/profiles/{profile_id}/activate"). `path` alone would
+    # be a distinct value per profile, which makes grouping impossible.
+    action = Column(String, nullable=False, index=True)
+    status_code = Column(Integer, nullable=False)
+    detail = Column(Text, nullable=True)
+    client_ip = Column(String, nullable=True)
+
+
 class BotConfig(Base):
     __tablename__ = "bot_config"
 

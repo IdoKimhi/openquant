@@ -34,7 +34,8 @@ React/TypeScript/Vite/Tailwind (frontend), and APScheduler (worker).
 │   │   ├── main.py              # FastAPI app, health endpoint, router registration
 │   │   ├── config.py            # Pydantic Settings
 │   │   ├── security.py          # Fernet, JWT, bcrypt  (authentication)
-│   │   ├── authz.py             # Principal, scopes, agent key gen  (authorization)
+│   │   ├── authz.py             # Principal, scopes, agent key gen, RateLimiter  (authorization)
+│   │   ├── audit.py             # AuditMiddleware + record_summary  (who changed what)
 │   │   ├── db.py                # SQLAlchemy + SQLite (lazy engine)
 │   │   ├── models.py            # ORM models
 │   │   ├── alpaca_client.py     # Paper-only Alpaca wrapper
@@ -55,7 +56,7 @@ React/TypeScript/Vite/Tailwind (frontend), and APScheduler (worker).
 │   │       ├── bot_config.py    # prefix /bot
 │   │       ├── dashboard.py     # prefix /dashboard
 │   │       └── agent_keys.py    # prefix /agent-keys    (human only)
-│   ├── tests/                   # 15 files, 175 tests, all passing
+│   ├── tests/                   # 17 files, 215 tests, all passing
 │   └── worker/
 │       ├── main.py              # entrypoint (python -m worker.main)
 │       └── scheduler.py         # BotWorker: APScheduler jobs, trading cycle
@@ -112,6 +113,24 @@ All 19 planned tasks are implemented and verified:
 - ✅ Agent access. `oq_`-prefixed scoped keys in a new `agent_keys` table, accepted by the same
   routes as the admin JWT and gated per-route by `require_scope`. 32 tests in
   `test_agent_keys.py`, all four scope boundaries verified against the running stack.
+- ✅ Agent audit trail (`app/audit.py`, `audit_log` table). One row per state-changing call,
+  whoever made it, with refused attempts recorded too. Reads are not recorded and request
+  bodies are never captured. 14 tests in `test_agent_audit.py`.
+- ✅ Agent rate limiting (`RateLimiter` in `app/authz.py`). Per-key, clock-aligned fixed
+  windows, 120 reads / 20 writes per minute by default. The admin session is deliberately not
+  limited. 15 tests in `test_agent_rate_limit.py`.
+- ✅ A read no longer writes. `last_used_at` was stamped on every agent request, so every *read*
+  took the SQLite write lock - and because authentication precedes the rate-limit check, even a
+  429 wrote. At the 120 reads/min the limiter allows, 8-way concurrency returned
+  `500 database is locked` on `GET /profiles` while the admin token (which never stamped it)
+  returned 40 clean 200s. The stamp is now throttled to once a minute, and `app/db.py` sets WAL
+  plus a 15s busy timeout. 6 tests in `test_agent_last_used_write.py`. See gotcha 18.
+- ✅ Schedule page timezone. `GET /bot/config` now reports `cron_timezone` - the value the
+  worker actually hands to `CronTrigger` - and the page renders it, instead of printing "UTC"
+  and getting a `9-16` schedule four hours off. See gotcha 16.
+- ⚠️ `market_hours_only` is dead. Stored, displayed, never read by the worker; unchecking it
+  does nothing. The UI now says so rather than implying extended-hours trading exists. Wiring
+  it up is a trading-path change and needs its own verification. See gotcha 17.
 
 There is no known failing functionality. Keep this file in sync with reality - it previously
 described finished work as "NOT STARTED", which wasted effort and hid real bugs.
@@ -237,6 +256,59 @@ moving it into the bundle, restores the flash. It reads
 `useTheme()` seeds its state from the class that script left on `<html>` rather than
 reimplementing the same decision, so the two cannot disagree. **The storage key is duplicated
 in both files - change one and you get a theme that resets every reload.**
+
+**16. The Schedule page's timezone text is served, not hardcoded.**
+`GET /bot/config` carries `cron_timezone`, which is `settings.bot_timezone` - the same value the
+worker hands to `CronTrigger`. The page used to print "Timezone: UTC", which is true of
+APScheduler's default and false of this app, so a `9-16` cron written against the label fired
+05:00-12:00 ET: gotcha 8, one layer up, where a user reads it. **Do not "fix" it by hardcoding
+"ET" in the frontend** - that is the same bug with a different literal, and it silently becomes
+wrong again the first time someone sets `BOT_TIMEZONE` to something else. Render the value the
+API reports. The presets are still written as US session times, so the page also warns when the
+configured zone is not `America/New_York`.
+
+**17. `market_hours_only` is stored, displayed, and never read.**
+The worker gates every cycle on Alpaca's market clock unconditionally and never looks at the
+flag, so unchecking "Market Hours Only" does not enable extended hours. The control now says so
+in the UI. **Wiring it up is a trading-path change** - it would let the bot place pre-market and
+after-hours orders - so it needs its own verification against the paper account before anyone
+turns it on. See "Verifying the trading path".
+
+**18. A read that writes will serialise on SQLite, and the rate limiter will not save you.**
+`_authenticate_agent_key` stamps `AgentKey.last_used_at` and commits. That runs on *every*
+authenticated agent request, so every read became a write. SQLite's default rollback journal
+takes a whole-database lock and fsyncs on commit, and the backend and the worker are separate
+containers sharing one file - so the reads serialised, blew past the 5s busy timeout, and
+`GET /profiles` returned `500 database is locked`. Measured at 8-way concurrency: one 500 out of
+140 agent reads, while the same load with the admin token - which never stamps anything - was
+40/40 clean. The tell is that only the *agent* path fails.
+
+The sting is the ordering. Authentication happens **before** `rate_limiter.check`, so a 429 still
+took the write lock. The limiter was not a brake on the database at all, and it was the thing
+making this reachable: 120 reads/min sustained is exactly the load that triggers it.
+
+Two fixes, and you need both:
+- **The stamp is throttled** to `LAST_USED_WRITE_INTERVAL` (60s). `last_used_at` is a
+  "when was this key last used" convenience the Agents page renders to the minute, not
+  authorisation input, so minute resolution costs nothing. The read path now writes at most once
+  a minute per key.
+- **WAL plus a 15s busy timeout in `app/db.py`**, via `build_engine()`. WAL is what lets the
+  worker's writes proceed while the backend serves reads, instead of the two blocking each other
+  by default. `journal_mode` is persistent in the file so it is set once per engine; `busy_timeout`
+  is **per-connection**, so it has to be in `connect_args` - setting it on one throwaway
+  connection leaves every later connection on the 5s default, which is the failure that actually
+  happened.
+
+`conftest.py` no longer sets WAL. It did, and that masked the real state: a test asserting WAL on
+the live engine passed for a week while `db.py` set nothing. The test now calls `build_engine()`
+against a `tmp_path` file and checks a *second*, freshly-opened connection - that is what proves
+`busy_timeout` is in `connect_args` rather than applied once.
+
+Two more things to carry forward: any test counting writes must count real commits (a
+SQLAlchemy `commit` event on the engine) rather than assert on `last_used_at`, because a test
+that only checks the field changed passes against the old code too - the old code changed it on
+every call. And if this ever moves to more than one backend replica, the in-process rate limiter
+needs the same treatment described under "Auditing and rate limiting agent actions".
 
 ## Development Workflow
 - **TDD mandatory:** Write failing tests first, then implementation
@@ -365,6 +437,54 @@ Two ways this goes wrong in practice:
 - **A 403 is ambiguous.** It means either "no Authorization header" or "valid agent key on a
   human-only route". Distinguish them by the `detail` string, not the status code, or a test
   will pass for the wrong reason.
+- **A 429 is a third thing.** It means "this key is over budget", and the
+  `detail` names the key. Do not fold it into the 403 handling above, and do not
+  teach the axios interceptor to treat it as an expired session.
+
+## Auditing and rate limiting agent actions
+
+Both are in the agent path and both are easy to get subtly wrong in the
+direction that makes them look fine.
+
+**`app/audit.py` - three decisions that are load-bearing.** Reads are not
+recorded (the dashboard polls, and a table of polls is a table nobody reads);
+request bodies are not captured (`record_summary` is opt-in per route, which is
+what keeps the Alpaca secret key out of a table any `read` key can fetch back);
+and a failed audit write never fails the request, because by then the action has
+already been applied - making a logging fault into a trading fault is exactly the
+confusion in gotcha 11. The principal comes from `request.state`, which
+`get_current_principal` sets. That works because Starlette 0.37 shares one
+`scope` dict across the middleware and the endpoint; it would **not** work with
+a `ContextVar`, which `BaseHTTPMiddleware` does not propagate back from the task
+it runs the endpoint in. A refused call is recorded too - the route never ran,
+so nothing downstream logged the attempt, and that 403 is usually the row you
+wanted.
+
+**`RateLimiter` in `app/authz.py` - three invariants.** It is charged *after*
+authentication and keyed on the resolved **key id**: keyed on the raw token or
+the prefix, anyone who knows a prefix could starve a real key by guessing under
+it, which turns a read-only limit into a DoS against the human's bot. Windows
+are **aligned to the clock**, not opened on a client's first request, or a
+caller straddling a boundary gets two budgets. And the **admin session is not
+limited at all** - one human in one browser is not the threat model, and a
+limiter that can lock the owner out of their own bot is the worse failure.
+
+The limiter is module-level process state, so the test suite resets it in an
+autouse fixture in `conftest.py`. That is not tidiness: `recreate_db` drops and
+recreates the tables per test, SQLite hands back the same row ids, so key id 1
+in one test is a *different key* from key id 1 in the last - but the in-memory
+bucket keyed on it is not, and without the reset the suite throttles itself and
+the failure looks flaky. **The same caveat is real in production**: this is
+exact for one backend replica and wrong behind a load balancer with two. If that
+ever happens it has to move to the shared SQLite volume, not gain a second
+in-process copy.
+
+**The limiter does not protect the database.** It is charged after
+authentication, which is correct for security, but authentication is itself a
+write (`last_used_at`), so a rejected request still took the SQLite write lock.
+Verifying the limiter by asserting only that a 429 comes back will pass against
+a build where every 429 is also a write. Check the write count on the throttled
+path - see gotcha 18.
 
 ## Verifying the trading path
 The trading cycle had never executed. Eleven independent bugs have now been found by actually
@@ -439,7 +559,7 @@ never an agent key. The base URL an agent uses is `<origin>/api` - nginx strips 
 | `/bot` | `PATCH /config` | `config:write` |
 | `/bot` | `POST /start`, `/stop`, `/pause` | `bot:control` |
 | `/bot` | `POST /kill-switch` | `bot:kill` |
-| `/dashboard` | `GET /account`, `/positions`, `/orders`, `/equity-curve`, `/logs`, `/market-clock` | `read` |
+| `/dashboard` | `GET /account`, `/positions`, `/orders`, `/equity-curve`, `/logs`, `/market-clock`, `/audit-log` | `read` |
 | `/health` | `GET /` (container healthcheck) | public |
 
 There is no agent-facing "place an order" endpoint. The existing action surface is

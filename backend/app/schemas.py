@@ -71,8 +71,23 @@ class ScopeInfo(BaseModel):
     granted_by_default: bool
 
 
+class AgentRateLimits(BaseModel):
+    """What an agent key is allowed to spend, so the numbers can be published
+    rather than discovered.
+
+    A 429 with no prior warning is a bad first experience for an integrator,
+    and the alternative - a key that silently stops working - is worse. The
+    admin who is about to hand out a key is the person who needs to know."""
+
+    requests_per_window: int
+    window_seconds: int
+    read_limit: int
+    write_limit: int
+
+
 class ScopeCatalogue(BaseModel):
     scopes: List[ScopeInfo]
+    rate_limits: AgentRateLimits
 
 
 # Credentials
@@ -167,6 +182,29 @@ class BotConfigResponse(BaseModel):
     active_profile_id: Optional[int] = None
     is_running: bool
     updated_at: datetime
+    # The IANA zone the worker evaluates the cron expression in, i.e.
+    # settings.bot_timezone, i.e. exactly what it hands to CronTrigger. Not a
+    # column: it is a server setting, so the UI has to be told rather than
+    # hardcode "ET" - the Schedule page claiming UTC is what made a "9-16"
+    # schedule fire 05:00-12:00 Eastern in the first place.
+    cron_timezone: str
+
+    class Config:
+        from_attributes = True
+
+
+class AuditLogResponse(BaseModel):
+    id: int
+    created_at: datetime
+    actor_kind: str
+    actor_label: Optional[str] = None
+    key_id: Optional[int] = None
+    method: str
+    path: str
+    action: str
+    status_code: int
+    detail: Optional[str] = None
+    client_ip: Optional[str] = None
 
     class Config:
         from_attributes = True
