@@ -2,12 +2,16 @@
 import { api } from './client'
 
 export interface BotConfig {
-  id: number
+  // No `id` or `created_at`: BotConfigResponse in app/schemas.py has neither -
+  // bot_config is a single row and the UI would have nothing to do with its
+  // id or creation time. They were declared here once, the API never sent
+  // them, and nothing read them - the exact dormant shape of gotcha 3's
+  // drift, where a field that has never been exercised is read for the same
+  // reason it was declared, and `undefined` renders until a date throws.
   schedule_cron: string
   market_hours_only: boolean
   active_profile_id: number | null
   is_running: boolean
-  created_at: string
   updated_at: string
   /**
    * IANA zone the worker evaluates the cron expression in - the backend's

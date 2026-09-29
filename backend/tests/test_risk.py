@@ -304,6 +304,169 @@ class TestRiskManager:
         assert "daily loss" in result.reason.lower() or "kill switch" in result.reason.lower()
 
 
+class TestExitsAreNeverGatedByThePositionCap:
+    """A position-size cap is a limit on *new* exposure, not on getting out.
+
+    Key decision #7: "Risk limits are gates, not flatteners ... deliberately
+    always permits sells, so a breach can never trap a position." Only
+    `POST /bot/kill-switch` closes positions.
+
+    That invariant was half-true. The daily-loss and kill-switch checks were
+    buy-only, but `validate_order` ran `check_position_size` on *every* order
+    including sells - so a position that grew past `risk_max_position_pct`
+    could not be sold by the strategy at all.
+
+    This is the ordinary way that happens, not an edge case: a position is
+    bought at 10% of equity because that is the cap, the position works, the
+    price doubles, and the position is now 20% of equity. RSI reversion sells
+    when it is overbought - precisely the case where a winner has run up - so
+    the strategy could not take profits on exactly the positions it most
+    wanted to close.
+
+    The existing `test_validate_order_still_allows_exits_when_limit_breached`
+    passed against this because it sold a position *within* the cap, so it
+    never exercised the trap its own name claims to guard. Asserting that sells
+    pass while handing `validate_order` a sell that respects every cap only
+    proves the caps are not being applied to sells at all - which is also not
+    the thing being claimed.
+    """
+
+    def test_a_position_that_ran_past_the_cap_can_still_be_sold(
+        self, risk_manager, active_profile, mock_db
+    ):
+        mock_db.query.return_value.filter.return_value.all.return_value = []
+
+        # Bought at the 10% cap; the price doubled, so the position is now
+        # 20000/100000 = 20% of equity - twice what the profile allows.
+        result = risk_manager.validate_order(
+            profile=active_profile,
+            equity=100000.0,
+            qty=100,
+            current_price=200.0,
+            current_positions_count=2,
+            side="sell",
+            daily_loss_pct=0.0,
+        )
+
+        assert result.allowed is True, (
+            f"a position past the cap must still be sellable, got: {result.reason}"
+        )
+
+    def test_the_same_order_as_a_buy_is_still_refused(
+        self, risk_manager, active_profile, mock_db
+    ):
+        """The exemption is for exits only.
+
+        Without this, "sells bypass the cap" could be satisfied by deleting
+        the check entirely - which is the other way to be wrong, and a much
+        worse one: nothing would bound a new position any more.
+        """
+        mock_db.query.return_value.filter.return_value.all.return_value = []
+
+        result = risk_manager.validate_order(
+            profile=active_profile,
+            equity=100000.0,
+            qty=100,
+            current_price=200.0,
+            current_positions_count=2,
+            side="buy",
+            daily_loss_pct=0.0,
+        )
+
+        assert result.allowed is False
+        assert "exceeds max" in result.reason
+
+    def test_a_sell_inside_the_cap_still_passes(
+        self, risk_manager, active_profile, mock_db
+    ):
+        """Regression guard for the case that already worked.
+
+        Without this, "sells bypass the cap" would also be satisfied by
+        deleting the check outright - which is the other way to be wrong, and a
+        much worse one, because nothing would bound a new position any more.
+        """
+        mock_db.query.return_value.filter.return_value.all.return_value = []
+
+        result = risk_manager.validate_order(
+            profile=active_profile,
+            equity=100000.0,
+            qty=1,
+            current_price=200.0,
+            current_positions_count=2,
+            side="sell",
+            daily_loss_pct=0.0,
+        )
+
+        assert result.allowed is True
+
+
+class TestTheCapIsMeasuredAgainstTheInvestableBase:
+    """`investable_equity` is the base for sizing *and* for the limits.
+
+    The docstring on `RiskManager.investable_equity` claims one base serves
+    both, and gives the reason: applying the allocation to sizing alone would
+    leave the limits on the whole account, "so a 15% cap would silently
+    become 18.75% of the money the operator asked to be investable".
+
+    That was not true of the call site. The worker passed raw account equity
+    into `validate_order`, so the cap was measured against a base 25% larger
+    than intended at a 0.8 allocation. Documenting an invariant the code does
+    not hold is worse than not documenting it, because the next reader trusts
+    the comment - and would then be surprised when a 10% cap permitted 12.5%.
+    """
+
+    def test_the_base_decides_what_the_cap_permits(
+        self, risk_manager, active_profile, mock_db
+    ):
+        mock_db.query.return_value.filter.return_value.all.return_value = []
+
+        # The cap is 10%. 9000 is 9% of a 100000 account - inside it - but
+        # 11.25% of the 80000 investable at a 0.8 allocation - outside it.
+        # Measured against the wrong base, the cap is 25% looser than the
+        # operator configured, which is precisely what the reserve is for.
+        def attempt(equity):
+            return risk_manager.validate_order(
+                profile=active_profile,
+                equity=equity,
+                qty=45,
+                current_price=200.0,
+                current_positions_count=2,
+                side="buy",
+                daily_loss_pct=0.0,
+            )
+
+        on_raw = attempt(100000.0)
+        on_investable = attempt(80000.0)
+
+        assert on_raw.allowed is True
+        assert on_investable.allowed is False
+        assert "exceeds max" in on_investable.reason
+
+    def test_an_order_on_the_cap_is_allowed_on_the_investable_base(
+        self, risk_manager, active_profile, mock_db
+    ):
+        """The cap is a ceiling, so an order exactly on it is permitted.
+
+        `check_position_size` uses `>`, not `>=`. Getting that backwards would
+        make a position exactly at the configured size unsizable - and the
+        strategy sizes *at* `position_size_pct`, so the common case would be
+        the broken one.
+        """
+        mock_db.query.return_value.filter.return_value.all.return_value = []
+
+        result = risk_manager.validate_order(
+            profile=active_profile,
+            equity=80000.0,          # investable at a 0.8 allocation
+            qty=40,                   # 40 x 200 = 8000 = exactly 10%
+            current_price=200.0,
+            current_positions_count=2,
+            side="buy",
+            daily_loss_pct=0.0,
+        )
+
+        assert result.allowed is True
+
+
 class TestRiskCheckResult:
     def test_risk_check_result_allowed(self):
         result = RiskCheckResult(allowed=True, reason=None)

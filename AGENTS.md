@@ -57,7 +57,7 @@ React/TypeScript/Vite/Tailwind (frontend), and APScheduler (worker).
 │   │       ├── bot_config.py    # prefix /bot
 │   │       ├── dashboard.py     # prefix /dashboard
 │   │       └── agent_keys.py    # prefix /agent-keys    (human only)
-│   ├── tests/                   # 22 files, 319 tests, all passing
+│   ├── tests/                   # 22 files, 328 tests, all passing
 │   └── worker/
 │       ├── main.py              # entrypoint (python -m worker.main)
 │       └── scheduler.py         # BotWorker: APScheduler jobs, trading cycle
@@ -192,14 +192,24 @@ remedies, all shipped:
   to a share per signal. Alpaca accepts fractional quantity on market orders only, so a
   fractional limit order is refused in `AlpacaClient.submit_order` by name.
 - `cash_sweep` (opt-in, inside `parameters`) buys a broad instrument with a bounded slice of
-  undeployed cash when the strategy finds no signal. Routed through `_process_signal`, so it
-  inherits the same risk checks and the same log write rather than being a second, quieter path
-  to the broker.
+  undeployed cash. It runs on every cycle **after** the signal loop, signal or no signal - the
+  quiet week is the whole point, so gating it on "strategy found nothing" would make it fire
+  precisely when the strategy was busy, which an early draft of this text claimed and the code
+  never did. A cycle that did place signals lowers the sweep's budget automatically: the cycle
+  sums the notional `_process_signal` reports and passes it as part of `deployed_value`, so the
+  sweep measures spare against the book as it now is, not as it was at the top of the cycle.
+  Routed through `_process_signal`, so it inherits the same risk checks and the same log write
+  rather than being a second, quieter path to the broker. The log line is written *after*
+  `_process_signal` returns, from what actually placed - it used to announce the sweep before
+  the checks ran, so a sweep the concurrency cap then refused was logged as bought.
 
 `RiskManager.investable_equity` applies `capital_allocation_pct` to **one** base that sizing and
 every risk limit are measured against. Applying it to sizing alone would shrink the positions
 while leaving the limits on the whole account, so a 15% cap would silently become 18.75% of the
-money the operator asked to be investable.
+money the operator asked to be investable. That invariant was false at the call site for a
+while - the worker handed `validate_order` raw account equity, so the cap was measured against
+the whole account while the strategies sized against 80% of it. `_process_signal` now takes
+`investable_equity` *required*, and pins it; see `tests/test_risk_equity_base.py`.
 
 **#6 - "money to invest".** `capital_allocation_pct` on `BotConfig`, defaulted to 1.0. The
 frontend edits it as a percentage and sends a fraction, like every other percentage in the app.
@@ -792,7 +802,12 @@ an artefact of the stub.
    parallel `/agent/v1` surface, because a duplicated router drifts from the original
 7. **Risk limits are gates, not flatteners** - `validate_order` blocks new buys once the daily
    loss limit is breached but deliberately always permits sells, so a breach can never trap a
-   position. Only `POST /bot/kill-switch` closes positions.
+   position. Only `POST /bot/kill-switch` closes positions. This was half-true for a release:
+   the daily-loss and kill-switch checks were buy-only, but the position-size cap ran on sells
+   too, so a position bought at the cap that then doubled could not be sold by the strategy at
+   all - the ordinary way a winner runs up, and exactly what RSI reversion sells into. The cap
+   now lives in the buy branch only; `TestsExitsAreNeverGatedByThePositionCap` in
+   `test_risk.py` pins both directions.
 8. **Least privilege by default** - a new agent key gets `read` and nothing else. `bot:kill` is
    never granted implicitly under any code path, and an agent key can never reach `/credentials`
    or `/agent-keys`.

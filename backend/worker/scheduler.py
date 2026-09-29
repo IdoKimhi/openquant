@@ -113,6 +113,23 @@ def _fill_from_order(order) -> tuple[float | None, float | None]:
     return float(price), float(qty)
 
 
+def binding_position_pct(profile: StrategyProfile) -> float:
+    """The per-position cap that actually binds, per strategy-profile.
+
+        min(risk_max_position_pct, position_size_pct)
+
+    The same arithmetic as `StrategyProfile.max_deployable_pct`, factored out
+    because a cycle log line wants to name the binding input without
+    re-implementing it. It used to print `risk_max_position_pct` and let the
+    reader assume it was the cap, which is exactly the class of wrong number
+    that made issue #2's idle cash invisible in the first place: the ceiling
+    the caps impose was nowhere to be seen.
+    """
+    position_size = float((profile.parameters or {}).get("position_size_pct", 0.0) or 0.0)
+    cap = max(float(profile.risk_max_position_pct or 0.0), 0.0)
+    return min(cap, position_size)
+
+
 class BotWorker:
     """Main worker class that runs the trading bot on schedule"""
     
@@ -364,7 +381,7 @@ class BotWorker:
                 f"{investable_equity:,.2f} investable; profile can deploy at most "
                 f"{profile.max_deployable_pct:.0%} of equity "
                 f"({profile.risk_max_concurrent_positions} positions x "
-                f"{profile.risk_max_position_pct:.0%})"
+                f"{binding_position_pct(profile):.0%} each)"
             )
 
             # Get current positions from Alpaca
@@ -387,13 +404,14 @@ class BotWorker:
             risk_manager = RiskManager(self.db)
 
             # Process each signal
+            placed_value = 0.0
             for signal in signals:
                 try:
-                    await self._process_signal(
+                    placed_value += await self._process_signal(
                         signal=signal,
                         profile=profile,
                         alpaca=alpaca,
-                        equity=equity,
+                        investable_equity=investable_equity,
                         current_positions_count=current_positions_count,
                         current_position_symbols=current_position_symbols,
                         risk_manager=risk_manager,
@@ -417,9 +435,13 @@ class BotWorker:
                 profile=profile,
                 alpaca=alpaca,
                 risk_manager=risk_manager,
-                equity=equity,
                 investable_equity=investable_equity,
-                deployed_value=deployed_value,
+                # This cycle's orders have spent cash the sweep was about to
+                # treat as spare. The count and symbols were already being
+                # updated in place by _process_signal; the *value* was not,
+                # and it is the value the sweep subtracts - see the returned
+                # notional from _process_signal.
+                deployed_value=deployed_value + placed_value,
                 current_positions_count=current_positions_count,
                 current_position_symbols=current_position_symbols,
                 daily_loss_pct=daily_loss_pct,
@@ -455,13 +477,35 @@ class BotWorker:
         signal,
         profile: StrategyProfile,
         alpaca: AlpacaClient,
-        equity: float,
+        investable_equity: float,
         current_positions_count: int,
         current_position_symbols: set,
         risk_manager: RiskManager,
         daily_loss_pct: float = 0.0
     ):
-        """Process a single trading signal with risk checks"""
+        """Process a single trading signal with risk checks.
+
+        Notification: this is the BUY-ONLY gate it looks like. `validate_order`
+        runs every check in the buy branch (see risk.py) - the position cap
+        among them - so `investable_equity` is deliberately *not* optional
+        here. The cap is the buyer of "one base for sizing and limits": the
+        amount the order is measured against is precisely the 80% the operator
+        asked to be investable.
+
+        There is deliberately no `equity` parameter. The account total plays no
+        part in what may be ordered, and an unused `equity` sitting beside
+        `investable_equity` was precisely how this call site regressed once -
+        someone read the signature, concluded "the cap is measured against the
+        account", and handed `validate_order` the wrong base. The bug is not
+        the mistake; it is the signature that invites it.
+
+        Returns the notional value placed (`qty * price`), or 0.0 when nothing
+        was placed - refused by a risk check, already holding the symbol, or
+        the broker rejected the order. The cycle sums this to know what the
+        cash sweep can still spend; without it the sweep would size itself
+        against the book as it was *before* this cycle's orders, and could
+        announce an order it then refused.
+        """
         symbol = signal.symbol
         side = signal.side
         qty = signal.qty
@@ -477,10 +521,13 @@ class BotWorker:
                 logger.warning(f"Could not get current price for {signal.symbol}")
                 return
         
-        # Risk validation
+        # Risk validation. The base passed is the *investable* one, so the
+        # position cap is measured against allocation x equity, agreeing with
+        # what the strategies sized against. Sizes and limits on two different
+        # bases made a true cap into a notional one (see test_risk_equity_base).
         result = risk_manager.validate_order(
             profile=profile,
-            equity=equity,
+            equity=investable_equity,
             qty=qty,
             current_price=current_price,
             current_positions_count=current_positions_count,
@@ -490,7 +537,7 @@ class BotWorker:
         
         if not result.allowed:
             logger.warning(f"Risk check failed for {symbol} {side}: {result.reason}")
-            return
+            return 0.0
         
         # Check if we already have a position in this symbol
         has_position = symbol in current_position_symbols
@@ -498,12 +545,12 @@ class BotWorker:
         # For sell signals, only proceed if we have a position to close
         if side == "sell" and not has_position:
             logger.info(f"No position in {symbol} to sell, skipping")
-            return
+            return 0.0
         
         # For buy signals, check if we already have a position (avoid doubling)
         if side == "buy" and has_position:
             logger.info(f"Already have position in {symbol}, skipping buy")
-            return
+            return 0.0
         
         # Place order
         try:
@@ -567,6 +614,11 @@ class BotWorker:
             elif side == "sell":
                 current_positions_count = max(0, current_positions_count - 1)
                 current_position_symbols.discard(symbol)
+
+            # The notional this cycle added to the book, so the cash sweep
+            # measures "spare" against the book as it now is, not as it was
+            # at the top of the cycle.
+            return qty * current_price
                 
         except Exception as e:
             logger.error(f"Failed to place order for {symbol}: {e}")
@@ -583,13 +635,13 @@ class BotWorker:
             )
             self.db.add(trade_log)
             self.db.commit()
+            return 0.0
     
     async def _maybe_sweep_cash(
         self,
         profile: StrategyProfile,
         alpaca: AlpacaClient,
         risk_manager: RiskManager,
-        equity: float,
         investable_equity: float,
         deployed_value: float,
         current_positions_count: int,
@@ -604,11 +656,22 @@ class BotWorker:
         is a second, deliberately dumb strategy for exactly that window: buy
         SPY (or whatever the operator picked) with a slice of the spare cash.
 
+        The cycle calls this *after* the signal loop, whether or not a signal
+        was found - the quiet week is the whole point, so gating it on "no
+        signal" would make it fire precisely when the strategy was busy. A
+        cycle that did place signals tightens the sweep automatically: the
+        caller passes `deployed_value` including this cycle's placements
+        (the sum of the notional `_process_signal` reports), so the sweep
+        measures spare against the book as it is, not as it was.
+
         It is routed through `_process_signal` rather than calling
         `submit_order` directly, so the sweep is subject to the same risk
         checks, the same "already hold this" guard and the same log write as a
         strategy signal. A second order path is a second set of rules, and the
-        rules are the whole reason this is safe.
+        rules are the whole reason this is safe. That is also why it returns
+        nothing: what it placed (or did not, and why) is recorded by the order
+        path itself, and the log line here reports the *result*, not the
+        intention.
 
         Four conditions, all of which have to hold:
 
@@ -664,24 +727,37 @@ class BotWorker:
             )
             return
 
-        logger.info(
-            f"Cash sweep: {qty} {symbol} (~{qty * price:,.2f}) from {budget:,.2f} "
-            f"of {spare:,.2f} spare ({sweep_pct:.0%} of investable)"
-        )
-
         from app.bot.strategies.base import Signal
 
-        await self._process_signal(
+        placed = await self._process_signal(
             signal=Signal(symbol=symbol, side="buy", qty=qty,
                           order_type="market", estimated_price=price),
             profile=profile,
             alpaca=alpaca,
-            equity=equity,
+            investable_equity=investable_equity,
             current_positions_count=current_positions_count,
             current_position_symbols=current_position_symbols,
             risk_manager=risk_manager,
             daily_loss_pct=daily_loss_pct,
         )
+
+        # Logged from what actually happened, not from what was intended.
+        # The old ordering logged the sweep *before* _process_signal ran its
+        # checks, so a sweep that the concurrency cap or the per-position cap
+        # then refused was still announced as bought - the mirror image of
+        # gotcha 10, where a trade that happened was logged as a failure.
+        # Either way the log reports a trade that did not occur.
+        if placed and placed > 0:
+            logger.info(
+                f"Cash sweep: bought {qty} {symbol} (~{placed:,.2f}) from "
+                f"{budget:,.2f} of {spare:,.2f} spare ({sweep_pct:.0%} of investable)"
+            )
+        else:
+            logger.info(
+                f"Cash sweep skipped for {symbol}: {qty} shares at ~{qty * price:,.2f} "
+                f"(spare {spare:,.2f}) - nothing was placed. The reason was logged "
+                f"just above by the order path."
+            )
 
     def _reconcile_fills_job(self):
         """Scheduled entry point for fill reconciliation.

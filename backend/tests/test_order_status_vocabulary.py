@@ -224,7 +224,8 @@ class TestWorkerWritesALoadableRow:
                 estimated_price=337.0,
             )
             asyncio.run(worker._process_signal(
-                signal=signal, profile=profile, alpaca=alpaca, equity=10000.0,
+                signal=signal, profile=profile, alpaca=alpaca,
+                investable_equity=10000.0,
                 current_positions_count=0, current_position_symbols=set(),
                 risk_manager=RiskManager(db), daily_loss_pct=0.0,
             ))

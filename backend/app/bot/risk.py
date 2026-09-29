@@ -217,32 +217,50 @@ class RiskManager:
     ) -> RiskCheckResult:
         """
         Validate an order against all risk checks.
-        For sell orders (flattening), only check position size is valid.
-        For buy orders, check all risk limits.
+
+        Every check here gates *new* exposure, so they apply to buys only.
+        This used to be subtler than it needed to be: the position-size cap
+        ran on sells too, with a comment claiming that was intended. It was
+        the one check that could trap a position, because a position bought
+        at the cap that has since doubled is over the cap *by construction* -
+        and that is exactly what RSI reversion sells into. The cap would
+        refuse the exit, so the strategy could not take profits on precisely
+        the positions it most wanted to close; only the kill-switch could
+        flatten them. Key decision #7: "risk limits are gates, not
+        flatteners ... deliberately always permits sells."
+
+        `equity` here is the *investable* base: the denominator the caps are
+        measured against is `investable_equity`, not account equity, so a
+        0.8 allocation keeps the limits on the 80% the operator asked to be
+        investable (see RiskManager.investable_equity).
         """
-        # Always check position size
+        if side.lower() != "buy":
+            # Sells are exempt from every gate above. They were exempt from
+            # the daily-loss and kill-switch checks all along; the position
+            # cap is the one that had to be moved into the buy branch.
+            return RiskCheckResult(allowed=True)
+
+        # Check position size
         result = self.check_position_size(profile, equity, qty, current_price)
         if not result.allowed:
             return result
-        
-        # For buy orders, check all risk limits
-        if side.lower() == "buy":
-            # Check daily loss
-            result = self.check_daily_loss(profile, equity, daily_loss_pct)
-            if not result.allowed:
-                return result
-            
-            # Check concurrent positions
-            result = self.check_max_concurrent_positions(profile, current_positions_count)
-            if not result.allowed:
-                return result
-            
-            # Check kill switch
-            result = self.should_trigger_kill_switch(profile, equity, daily_loss_pct)
-            if not result.allowed:
-                return RiskCheckResult(
-                    allowed=False,
-                    reason=f"Kill switch triggered: {result.reason}"
-                )
-        
+
+        # Check daily loss
+        result = self.check_daily_loss(profile, equity, daily_loss_pct)
+        if not result.allowed:
+            return result
+
+        # Check concurrent positions
+        result = self.check_max_concurrent_positions(profile, current_positions_count)
+        if not result.allowed:
+            return result
+
+        # Check kill switch
+        result = self.should_trigger_kill_switch(profile, equity, daily_loss_pct)
+        if not result.allowed:
+            return RiskCheckResult(
+                allowed=False,
+                reason=f"Kill switch triggered: {result.reason}"
+            )
+
         return RiskCheckResult(allowed=True)
