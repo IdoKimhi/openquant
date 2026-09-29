@@ -80,12 +80,37 @@ function safeAgo(value: string | null | undefined) {
   return formatDistanceToNow(date, { addSuffix: true })
 }
 
+/**
+ * The only two conversions between "the number a person types" and "the
+ * fraction the API stores".
+ *
+ * Every percentage in this form crosses here exactly once, in `onSubmit`, and
+ * comes back exactly once, in `handleEdit`. The alternative - keeping the form
+ * in fractions and converting per input - puts the conversion inside
+ * react-hook-form's `setValueAs`, which `form.reset()` bypasses: the box would
+ * show a percent after an edit and a fraction after a strategy change, from
+ * the same field, with no way to tell which is which.
+ *
+ * These five fields were previously fractions under a "(%)" label, so typing
+ * "15" was refused by the input's own `max="1"` and the box showed "0.15"
+ * where it said 15%. That is the same shape of bug as the idle cash of issue
+ * #2: the number entered is not the number used.
+ */
+const frac = (percent: number | null | undefined): number => (percent ?? 0) / 100
+const pct = (fraction: number | null | undefined): number => (fraction ?? 0) * 100
+
 const profileSchema = z.object({
   name: z.string().min(1, 'Profile name is required'),
   strategy_type: z.enum(['sma_crossover', 'rsi_reversion', 'momentum_breakout']),
-  risk_max_position_pct: z.number().min(0.01).max(1).default(0.10),
-  risk_max_daily_loss_pct: z.number().min(0.01).max(1).default(0.05),
-  risk_max_concurrent_positions: z.number().int().min(1).max(20).default(5),
+  // Percentages are 1-100 here, matching the "(%)" on the labels and the
+  // numbers a person types. 0.15 x 10 mirrors app/schemas.py
+  // StrategyProfileBase: those used to be 0.10 x 5 in this file while the API
+  // defaulted to 0.15 x 10, and a form that pre-fills the lower pair creates a
+  // profile structurally capped at 50% of the account - the idle cash of issue
+  // #2, arrived at by typing nothing.
+  risk_max_position_pct: z.number().min(1).max(100).default(15),
+  risk_max_daily_loss_pct: z.number().min(1).max(100).default(5),
+  risk_max_concurrent_positions: z.number().int().min(1).max(20).default(10),
   symbols: z.array(z.string().min(1)).min(1, 'At least one symbol is required'),
   fast_period: z.number().int().min(1).max(200).optional(),
   slow_period: z.number().int().min(1).max(200).optional(),
@@ -93,21 +118,66 @@ const profileSchema = z.object({
   oversold: z.number().int().min(1).max(99).optional(),
   overbought: z.number().int().min(1).max(99).optional(),
   lookback: z.number().int().min(2).max(100).optional(),
-  position_size_pct: z.number().min(0.01).max(1).optional()
+  position_size_pct: z.number().min(1).max(100).optional(),
+  allow_fractional_shares: z.boolean().default(false),
+  cash_sweep_enabled: z.boolean().default(false),
+  cash_sweep_symbol: z.string().optional(),
+  cash_sweep_pct: z.number().min(0).max(100).optional()
 })
+  // The contradiction the backend also rejects (issue #2). Duplicated here
+  // because the API's 422 arrives as a JSON `detail` array that
+  // `err.response?.data?.detail` renders as "[object Object]" - so relying on
+  // the server alone would show the user an unreadable error for a mistake the
+  // form could have caught while they were typing.
+  //
+  // Percent against percent, so the comparison is unaffected by the scale
+  // change above - only the units both sides are now expressed in.
+  .refine(
+    (d) => d.position_size_pct == null || d.position_size_pct <= d.risk_max_position_pct,
+    {
+      message:
+        'Position Size % cannot exceed Max Position Size %. The strategy orders at Position Size % and the risk check refuses anything above Max Position Size %, so every order would be rejected.',
+      path: ['position_size_pct'],
+    }
+  )
 
 type ProfileForm = z.infer<typeof profileSchema>
 
 const emptyForm = {
   name: '',
   strategy_type: 'sma_crossover' as StrategyType,
-  risk_max_position_pct: 0.10,
-  risk_max_daily_loss_pct: 0.05,
-  risk_max_concurrent_positions: 5,
+  risk_max_position_pct: 15,
+  risk_max_daily_loss_pct: 5,
+  risk_max_concurrent_positions: 10,
   symbols: ['AAPL'],
   fast_period: 10,
   slow_period: 30,
-  position_size_pct: 0.10
+  position_size_pct: 15,
+  allow_fractional_shares: false,
+  cash_sweep_enabled: false,
+  cash_sweep_symbol: 'SPY',
+  cash_sweep_pct: 20
+}
+
+/**
+ * The most of the account a set of caps can deploy, live, as the form stands.
+ *
+ * The same arithmetic as `StrategyProfile.max_deployable_pct` on the server
+ * (which is what the saved-profile cards render), recomputed here so the
+ * configurator can show the ceiling *while the numbers are being changed* -
+ * which is the only moment it is useful. 5 positions at 15% is 75%, and a
+ * user lowering nothing at all has a profile that can never deploy a quarter
+ * of their account.
+ *
+ * Takes and returns percents, to match the form the numbers are read out of.
+ * A fraction in here would put this display on a different scale from the box
+ * beside it - `min(cap, sizePct)` comparing 15 against 0.15 always picks
+ * 0.15, which reads as "position size is the binding cap" no matter what the
+ * user typed.
+ */
+function deployableCeiling(positions: number, positionCap: number, sizePct?: number): number {
+  const per = Math.min(positionCap, sizePct ?? positionCap)
+  return Math.min(100, Math.max(0, positions) * Math.max(0, per))
 }
 
 export function StrategyPage() {
@@ -160,19 +230,22 @@ export function StrategyPage() {
   const handleStrategyChange = (type: StrategyType) => {
     setActiveStrategy(type)
     form.setValue('strategy_type', type as any)
+    // `strategyDefaults` is stored in the API's units - a fraction - because it
+    // is also what `describeParams` reads back off a saved profile. The form
+    // is in percent, so it crosses here.
     const d = strategyDefaults[type]
     if (type === 'sma_crossover') {
       form.setValue('fast_period', d.fast_period)
       form.setValue('slow_period', d.slow_period)
-      form.setValue('position_size_pct', d.position_size_pct)
+      form.setValue('position_size_pct', pct(d.position_size_pct))
     } else if (type === 'rsi_reversion') {
       form.setValue('period', d.period)
       form.setValue('oversold', d.oversold)
       form.setValue('overbought', d.overbought)
-      form.setValue('position_size_pct', d.position_size_pct)
+      form.setValue('position_size_pct', pct(d.position_size_pct))
     } else {
       form.setValue('lookback', d.lookback)
-      form.setValue('position_size_pct', d.position_size_pct)
+      form.setValue('position_size_pct', pct(d.position_size_pct))
     }
   }
 
@@ -198,23 +271,41 @@ export function StrategyPage() {
     setError(null)
     try {
       const d = strategyDefaults[activeStrategy]
+      // `parameters` is the API's shape, so it is fractions from here down.
+      // The initialiser is unreachable for any of the three enum values below -
+      // each branch reassigns - and stays a fraction because it comes straight
+      // out of `strategyDefaults` rather than out of the form.
       let parameters: StrategyParameters = { position_size_pct: d.position_size_pct }
       if (activeStrategy === 'sma_crossover') {
-        parameters = { fast_period: data.fast_period, slow_period: data.slow_period, position_size_pct: data.position_size_pct }
+        parameters = { fast_period: data.fast_period, slow_period: data.slow_period, position_size_pct: frac(data.position_size_pct) }
       } else if (activeStrategy === 'rsi_reversion') {
-        parameters = { period: data.period, oversold: data.oversold, overbought: data.overbought, position_size_pct: data.position_size_pct }
+        parameters = { period: data.period, oversold: data.oversold, overbought: data.overbought, position_size_pct: frac(data.position_size_pct) }
       } else {
-        parameters = { lookback: data.lookback, position_size_pct: data.position_size_pct }
+        parameters = { lookback: data.lookback, position_size_pct: frac(data.position_size_pct) }
+      }
+
+      // The sweep lives inside the parameters JSON rather than in a column,
+      // because it is a strategy choice rather than a risk limit - and because
+      // an operator who never wants it should not have a column in the schema
+      // for it. The `enabled` flag is what decides, so an unfinished block
+      // (symbol typed, pct left at 0) is inert on the worker side too.
+      if (data.cash_sweep_enabled && data.cash_sweep_symbol) {
+        parameters.cash_sweep = {
+          enabled: true,
+          symbol: data.cash_sweep_symbol.toUpperCase(),
+          pct: frac(data.cash_sweep_pct)
+        }
       }
 
       const profileData: ProfileCreate = {
         name: data.name,
         strategy_type: data.strategy_type,
         parameters,
-        risk_max_position_pct: data.risk_max_position_pct,
-        risk_max_daily_loss_pct: data.risk_max_daily_loss_pct,
+        risk_max_position_pct: frac(data.risk_max_position_pct),
+        risk_max_daily_loss_pct: frac(data.risk_max_daily_loss_pct),
         risk_max_concurrent_positions: data.risk_max_concurrent_positions,
-        symbols: data.symbols
+        symbols: data.symbols,
+        allow_fractional_shares: data.allow_fractional_shares
       }
 
       if (editingId) {
@@ -249,8 +340,8 @@ export function StrategyPage() {
     form.reset({
       name: profile.name,
       strategy_type: profile.strategy_type,
-      risk_max_position_pct: profile.risk_max_position_pct,
-      risk_max_daily_loss_pct: profile.risk_max_daily_loss_pct,
+      risk_max_position_pct: pct(profile.risk_max_position_pct),
+      risk_max_daily_loss_pct: pct(profile.risk_max_daily_loss_pct),
       risk_max_concurrent_positions: profile.risk_max_concurrent_positions,
       symbols: profile.symbols,
       fast_period: profile.parameters?.fast_period || 10,
@@ -259,7 +350,13 @@ export function StrategyPage() {
       oversold: profile.parameters?.oversold || 30,
       overbought: profile.parameters?.overbought || 70,
       lookback: profile.parameters?.lookback || 20,
-      position_size_pct: profile.parameters?.position_size_pct || 0.10
+      position_size_pct: pct(profile.parameters?.position_size_pct ?? 0.15),
+      allow_fractional_shares: profile.allow_fractional_shares ?? false,
+      // `?? emptyForm...` rather than a bare literal, so a profile with no
+      // sweep block opens the configurator on the same values a new one does.
+      cash_sweep_enabled: profile.parameters?.cash_sweep?.enabled ?? false,
+      cash_sweep_symbol: profile.parameters?.cash_sweep?.symbol ?? 'SPY',
+      cash_sweep_pct: pct(profile.parameters?.cash_sweep?.pct ?? 0.2)
     })
   }
 
@@ -269,25 +366,30 @@ export function StrategyPage() {
     setActiveStrategy('sma_crossover')
   }
 
+  // min/max are in the *form's* units, so the percentage field is 1-100 and not
+  // the 0.01-1 it is stored in. These attributes are what stops a browser
+  // accepting a number the schema will then reject, and a field whose bounds
+  // disagree with its label is worse than one with no bounds at all - see the
+  // note above `frac()`.
   const strategyFields = () => {
     switch (activeStrategy) {
       case 'sma_crossover':
         return [
           { name: 'fast_period', label: 'Fast Period', min: 1, max: 200, step: 1 },
           { name: 'slow_period', label: 'Slow Period', min: 1, max: 200, step: 1 },
-          { name: 'position_size_pct', label: 'Position Size %', min: 0.01, max: 1, step: 0.01 }
+          { name: 'position_size_pct', label: 'Position Size %', min: 1, max: 100, step: 1 }
         ]
       case 'rsi_reversion':
         return [
           { name: 'period', label: 'RSI Period', min: 2, max: 50, step: 1 },
           { name: 'oversold', label: 'Oversold Threshold', min: 1, max: 99, step: 1 },
           { name: 'overbought', label: 'Overbought Threshold', min: 1, max: 99, step: 1 },
-          { name: 'position_size_pct', label: 'Position Size %', min: 0.01, max: 1, step: 0.01 }
+          { name: 'position_size_pct', label: 'Position Size %', min: 1, max: 100, step: 1 }
         ]
       default:
         return [
           { name: 'lookback', label: 'Lookback Period', min: 2, max: 100, step: 1 },
-          { name: 'position_size_pct', label: 'Position Size %', min: 0.01, max: 1, step: 0.01 }
+          { name: 'position_size_pct', label: 'Position Size %', min: 1, max: 100, step: 1 }
         ]
     }
   }
@@ -301,9 +403,9 @@ export function StrategyPage() {
   }
 
   return (
-    <div className="max-w-4xl mx-auto space-y-6">
-      <div className="flex items-start justify-between gap-4">
-        <div>
+    <div className="max-w-4xl mx-auto space-y-4 sm:space-y-6">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
           <h1 className="text-2xl font-bold text-body">Strategy</h1>
           <p className="mt-1 text-sm text-muted">
             The profile the bot is trading right now, and how to switch it.
@@ -313,7 +415,7 @@ export function StrategyPage() {
           onClick={() => { resetForm(); setShowForm(v => !v) }}
           className="btn-secondary shrink-0"
         >
-          {showForm ? <ChevronDown className="h-4 w-4 mr-1" /> : <Plus className="h-4 w-4 mr-1" />}
+          {showForm ? <ChevronDown className="h-4 w-4 mr-1 flex-shrink-0" /> : <Plus className="h-4 w-4 mr-1 flex-shrink-0" />}
           {showForm ? 'Hide configurator' : 'New profile'}
         </button>
       </div>
@@ -413,7 +515,38 @@ export function StrategyPage() {
                   {activeProfile.risk_max_concurrent_positions}
                 </div>
               </div>
+              {/* The ceiling those three imply (issue #2). `max_deployable_pct`
+                  comes from the server so the number here and the number the
+                  worker logs are the same arithmetic, not two copies of it.
+                  Coloured as a warning below 95% because that is the shape of
+                  the original complaint - a profile that looks configured and
+                  can never reach a quarter of the account. */}
+              <div>
+                <div className="text-xs text-muted">Can deploy at most</div>
+                <div className={`text-lg font-semibold ${
+                  activeProfile.max_deployable_pct < 0.95
+                    ? 'text-warning-fg'
+                    : 'text-success-fg'
+                }`}>
+                  {(activeProfile.max_deployable_pct * 100).toFixed(0)}%
+                </div>
+              </div>
             </div>
+
+            {activeProfile.max_deployable_pct < 0.95 && (
+              <p className="mt-2 text-xs text-muted">
+                {activeProfile.risk_max_concurrent_positions} positions at{' '}
+                {(
+                  Math.min(
+                    activeProfile.risk_max_position_pct,
+                    activeProfile.parameters?.position_size_pct ?? activeProfile.risk_max_position_pct
+                  ) * 100
+                ).toFixed(0)}
+                % leaves the rest of the account in cash permanently - waiting
+                for more signals will not change it. Raise Max concurrent, Max
+                position, or Position size %.
+              </p>
+            )}
 
             <p className="text-xs text-muted pt-3 border-t border-line">
               {strategyNotes[activeProfile.strategy_type]}
@@ -489,8 +622,12 @@ export function StrategyPage() {
             No profiles yet. Use "New profile" to create one.
           </div>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full">
+          <div className="overflow-x-auto scrollbar-thin">
+            {/* min-w so the columns keep their size and this scrolls, instead
+                of the browser compressing Activate / Edit / Delete into one
+                character per line. See the dashboard tables for the same
+                reasoning. */}
+            <table className="w-full min-w-[720px]">
               <thead>
                 <tr className="text-left text-sm text-muted border-b border-line">
                   <th className="pb-3 font-medium">Name</th>
@@ -589,7 +726,7 @@ export function StrategyPage() {
               </div>
               <div>
                 <label className="label">Strategy Type</label>
-                <div className="grid grid-cols-3 gap-2">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                   {strategyOptions.map(option => (
                     <button
                       key={option.value}
@@ -616,8 +753,9 @@ export function StrategyPage() {
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {strategyFields().map(field => (
                   <div key={field.name}>
-                    <label className="label">{field.label}</label>
+                    <label className="label" htmlFor={field.name}>{field.label}</label>
                     <input
+                      id={field.name}
                       {...form.register(field.name as any, { valueAsNumber: true })}
                       type="number"
                       className="input"
@@ -637,33 +775,161 @@ export function StrategyPage() {
               <h3 className="font-medium text-body mb-4">Risk Management</h3>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <div>
-                  <label className="label">Max Position Size (%)</label>
+                  <label className="label" htmlFor="risk_max_position_pct">
+                    Max Position Size (%)
+                  </label>
                   <input
+                    id="risk_max_position_pct"
                     {...form.register('risk_max_position_pct', { valueAsNumber: true })}
-                    type="number" className="input" min="0.01" max="1" step="0.01"
+                    type="number" className="input" min="1" max="100" step="1"
                   />
                 </div>
                 <div>
-                  <label className="label">Max Daily Loss (%)</label>
+                  <label className="label" htmlFor="risk_max_daily_loss_pct">
+                    Max Daily Loss (%)
+                  </label>
                   <input
+                    id="risk_max_daily_loss_pct"
                     {...form.register('risk_max_daily_loss_pct', { valueAsNumber: true })}
-                    type="number" className="input" min="0.01" max="1" step="0.01"
+                    type="number" className="input" min="1" max="100" step="1"
                   />
                 </div>
                 <div>
-                  <label className="label">Max Concurrent Positions</label>
+                  <label className="label" htmlFor="risk_max_concurrent_positions">
+                    Max Concurrent Positions
+                  </label>
                   <input
+                    id="risk_max_concurrent_positions"
                     {...form.register('risk_max_concurrent_positions', { valueAsNumber: true })}
                     type="number" className="input" min="1" max="20" step="1"
                   />
                 </div>
               </div>
+
+              {/* The deployment ceiling, live (issue #2).
+
+                  This is the number that answers "why is my cash sitting
+                  idle", and it was nowhere to be seen. Five positions at 15%
+                  is 75%: a quarter of the account is unreachable by
+                  construction, no amount of waiting for a signal changes it,
+                  and the profile just looks configured.
+
+                  Both caps are shown because either can be the binding one -
+                  the strategy sizes with Position Size %, the risk check
+                  refuses above Max Position Size %, and the smaller of the two
+                  is what actually gets ordered. `form.watch` rather than state
+                  so this re-renders as the numbers are typed. */}
+              {(() => {
+                const cap = form.watch('risk_max_position_pct') ?? 0
+                const count = form.watch('risk_max_concurrent_positions') ?? 0
+                const sizePct = form.watch('position_size_pct')
+                const ceiling = deployableCeiling(count, cap, sizePct)
+                const binding = Math.min(cap, sizePct ?? cap)
+                const cappedAt100 = count * binding > 100
+                return (
+                  <div className="mt-4 bg-canvas rounded-lg p-4">
+                    <div className="flex flex-wrap items-baseline justify-between gap-2">
+                      <span className="text-sm font-medium text-body">
+                        Can deploy at most
+                      </span>
+                      <span className={`text-2xl font-bold ${
+                        ceiling < 95 ? 'text-warning-fg' : 'text-success-fg'
+                      }`}>
+                        {ceiling.toFixed(0)}%
+                      </span>
+                    </div>
+                    <p className="mt-1 text-xs text-muted">
+                      {count} position{count === 1 ? '' : 's'} x{' '}
+                      {binding.toFixed(0)}%
+                      {binding === cap ? ' (max position size)' : ' (position size)'}
+                      {cappedAt100 && ' - capped at 100% of the account'}
+                      {' '}of equity. The rest stays in cash no matter how many
+                      signals arrive.
+                    </p>
+                  </div>
+                )
+              })()}
+
+              {/* Fractional sizing (issue #2). Opt-in because Alpaca accepts a
+                  fractional quantity on a market order only - a fractional
+                  limit order is refused by the broker. Off by default, so a
+                  profile that never considered it keeps trading whole shares. */}
+              <label className="mt-4 flex items-start gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  {...form.register('allow_fractional_shares')}
+                  className="mt-1 h-4 w-4 rounded border-line"
+                />
+                <span>
+                  <span className="text-sm font-medium text-body">
+                    Allow fractional shares
+                  </span>
+                  <span className="block text-xs text-muted">
+                    Deploys the remainder of a position instead of discarding up
+                    to one share per signal. Market orders only, which is all
+                    this bot sends.
+                  </span>
+                </span>
+              </label>
+            </div>
+
+            {/* Cash sweep (issue #2). The other half of the idle-cash problem:
+                a strategy trades on a signal, so a quiet week leaves the cash
+                uninvested indefinitely. Off by default - this opens a real
+                position and the operator should have to ask for it. */}
+            <div className="border-t border-line pt-6">
+              <h3 className="font-medium text-body mb-1">Cash sweep</h3>
+              <p className="text-xs text-muted mb-4">
+                When the strategy finds no signal, buy a broad instrument with a
+                slice of whatever is still undeployed. Bounded per cycle, and
+                never larger than the Max Position Size above.
+              </p>
+              <label className="flex items-start gap-2 cursor-pointer mb-4">
+                <input
+                  type="checkbox"
+                  {...form.register('cash_sweep_enabled')}
+                  className="mt-1 h-4 w-4 rounded border-line"
+                />
+                <span className="text-sm font-medium text-body">
+                  Sweep idle cash
+                </span>
+              </label>
+              {form.watch('cash_sweep_enabled') && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div>
+                    <label className="label">Instrument</label>
+                    <input
+                      {...form.register('cash_sweep_symbol')}
+                      className="input"
+                      placeholder="SPY"
+                    />
+                  </div>
+                  <div>
+                    <label className="label" htmlFor="cash_sweep_pct">
+                      Max % of equity per cycle
+                    </label>
+                    <input
+                      id="cash_sweep_pct"
+                      {...form.register('cash_sweep_pct', { valueAsNumber: true })}
+                      type="number"
+                      className="input"
+                      min="0"
+                      max="100"
+                      step="1"
+                    />
+                    <p className="mt-1 text-xs text-muted">
+                      A per-cycle ceiling, not a target. Leave it at 0 to keep
+                      the sweep off.
+                    </p>
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="border-t border-line pt-6">
-              <div className="flex items-center justify-between mb-4">
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
                 <h3 className="font-medium text-body">Trading Symbols</h3>
-                <button type="button" onClick={() => appendSymbol('')} className="btn-secondary text-sm">
+                <button type="button" onClick={() => appendSymbol('')} className="btn-secondary text-sm flex-shrink-0">
                   <Plus className="h-4 w-4 mr-1" />
                   Add Symbol
                 </button>
@@ -691,7 +957,7 @@ export function StrategyPage() {
               )}
             </div>
 
-            <div className="flex items-center justify-end gap-3 border-t border-line pt-4">
+            <div className="flex flex-wrap items-center justify-end gap-3 border-t border-line pt-4">
               <button type="button" onClick={() => { resetForm(); setShowForm(false) }} className="btn-secondary">
                 Cancel
               </button>

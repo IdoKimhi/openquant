@@ -157,8 +157,13 @@
     @apply block text-sm font-medium text-body mb-1;
   }
 
+  /* p-4 on small screens, p-6 from sm up (issue #1). 24px of padding on a
+     360px viewport left the content 200px wide, and the 4-column summary grid
+     was already down to one column by then - so the padding was a large part
+     of the horizontal squeeze. One class, both breakpoints: a page that
+     overrides it locally re-introduces the overflow it was fixing. */
   .card {
-    @apply bg-surface shadow-sm rounded-lg p-6;
+    @apply bg-surface shadow-sm rounded-lg p-4 sm:p-6;
   }
 
   .badge {

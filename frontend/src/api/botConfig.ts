@@ -17,12 +17,20 @@ export interface BotConfig {
    * against the label fired 05:00-12:00 Eastern.
    */
   cron_timezone: string
+  /**
+   * The share of account equity the strategies may size positions against
+   * (issue #6, the "money to invest" control). 1.0 is the whole account; 0.8
+   * holds a 20% cash reserve. Never null - the backend normalises a row written
+   * before the column existed, and null here renders as a blank field.
+   */
+  capital_allocation_pct: number
 }
 
 export interface BotConfigUpdate {
   schedule_cron?: string
   market_hours_only?: boolean
   active_profile_id?: number | null
+  capital_allocation_pct?: number
 }
 
 export const botConfigApi = {

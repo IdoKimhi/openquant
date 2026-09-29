@@ -36,12 +36,13 @@ React/TypeScript/Vite/Tailwind (frontend), and APScheduler (worker).
 │   │   ├── security.py          # Fernet, JWT, bcrypt  (authentication)
 │   │   ├── authz.py             # Principal, scopes, agent key gen, RateLimiter  (authorization)
 │   │   ├── audit.py             # AuditMiddleware + record_summary  (who changed what)
-│   │   ├── db.py                # SQLAlchemy + SQLite (lazy engine)
+│   │   ├── db.py                # SQLAlchemy + SQLite (lazy engine) + ensure_schema migration
 │   │   ├── models.py            # ORM models
 │   │   ├── alpaca_client.py     # Paper-only Alpaca wrapper
 │   │   ├── schemas.py           # Pydantic request/response models
 │   │   ├── bot/
 │   │   │   ├── engine.py        # Strategy execution
+│   │   │   ├── market_hours.py  # Session classification, trading_allowed, skip_reason
 │   │   │   ├── risk.py          # RiskManager: sizing, daily loss, concurrency, kill-switch
 │   │   │   └── strategies/
 │   │   │       ├── base.py      # BaseStrategy, Signal, bars_request/lookback_start
@@ -56,7 +57,7 @@ React/TypeScript/Vite/Tailwind (frontend), and APScheduler (worker).
 │   │       ├── bot_config.py    # prefix /bot
 │   │       ├── dashboard.py     # prefix /dashboard
 │   │       └── agent_keys.py    # prefix /agent-keys    (human only)
-│   ├── tests/                   # 17 files, 215 tests, all passing
+│   ├── tests/                   # 22 files, 319 tests, all passing
 │   └── worker/
 │       ├── main.py              # entrypoint (python -m worker.main)
 │       └── scheduler.py         # BotWorker: APScheduler jobs, trading cycle
@@ -128,12 +129,116 @@ All 19 planned tasks are implemented and verified:
 - ✅ Schedule page timezone. `GET /bot/config` now reports `cron_timezone` - the value the
   worker actually hands to `CronTrigger` - and the page renders it, instead of printing "UTC"
   and getting a `9-16` schedule four hours off. See gotcha 16.
-- ⚠️ `market_hours_only` is dead. Stored, displayed, never read by the worker; unchecking it
-  does nothing. The UI now says so rather than implying extended-hours trading exists. Wiring
-  it up is a trading-path change and needs its own verification. See gotcha 17.
+- ✅ `market_hours_only` is enforced. It was stored, displayed, and read by nothing, while
+  `is_open` alone let the bot trade 04:00-20:00 ET - so a position could open at 19:30 and sit
+  overnight with no liquidity behind it. `app/bot/market_hours.py` now gates the cycle on the
+  broker's clock for the regular session. See gotcha 17.
+- ✅ Fill price and quantity are recorded, at submit time and by a 1-minute reconciler for the
+  orders that fill after their cycle closed. All 52 historical rows are now `filled` with real
+  prices. See gotcha 20.
+- ✅ Capital deployment is visible and adjustable: `max_deployable_pct` exposes the ceiling,
+  `capital_allocation_pct` is the "money to invest" base, fractional shares and a cash sweep
+  are opt-in, and the defaults deploy more than they used to. See gotcha 21.
+- ✅ Mobile layout. The drawer, the tables, the cards and the tab strip all work at 360px.
 
 There is no known failing functionality. Keep this file in sync with reality - it previously
 described finished work as "NOT STARTED", which wasted effort and hid real bugs.
+
+## Issues Closed 2026-09-29
+
+Six reported issues. All fixed; all were reachable through the UI, and **three of them were
+found by the fix for another one** rather than by looking for them.
+
+**#3 - `market_hours_only` was never read.** New `app/bot/market_hours.py`.
+`market_session_state()` classifies the session, `trading_allowed()` decides, `skip_reason()`
+explains. The broker's `is_open` is authoritative - it knows about holidays and half-day
+closes, which a wall clock does not - and the wall clock in `MARKET_TZ` subdivides it into
+pre-market / regular / after-hours. 31 tests in `test_market_hours.py`.
+
+The cause turned out to be a timezone bug wearing a trading bug's clothes. The trades logged
+at "19:30-19:50 ET" were stored as naive UTC, which is **15:30-15:50 EDT** - the last half
+hour of the regular session. The bot had never traded after hours; the dashboard rendered
+naive UTC in the browser's zone. Fixing the timestamps (below) is what made #3 legible, and
+either fix alone would have left the dashboard lying.
+
+**#4 - equity-curve and timestamp timezone.** `UtcDatetime` in `app/schemas.py` is an
+`Annotated[datetime, BeforeValidator]` on every response timestamp, so a naive datetime becomes
+explicitly UTC *at the serialization boundary* rather than in six call sites that each have to
+remember. `safeFormat(value, pattern, timeZone?)` in `lib/format.ts` renders it in a named zone
+using the Intl wall-clock-shift technique, and the dashboard passes `marketClock.timezone` -
+the value the worker actually uses - to every date it draws.
+
+**#5 - fill price and quantity were never recorded.** `TradeLog.filled_price`/`filled_qty` were
+NULL on all 52 rows in the live database. `_fill_from_order(order)` reads the fill off a broker
+order and coerces the two `Decimal`s (gotcha 5b again). Submit-time capture gets the immediate
+case; `_reconcile_fills` gets the rest, on a 1-minute job, because an order that lands at the
+broker after the cycle closes is invisible to the cycle that placed it. 15 tests.
+
+The reconciler found the opposite of what the data suggested. All 52 rows were `submitted` with
+no fill, which reads as "the orders never executed" - but Alpaca's order history was still
+there and all 52 came back **filled**. They had all executed; the app simply never looked. So
+the reconciler is a first-class feature, not a backstop for a rare case.
+
+**#2 - ~70% of capital deployed, by construction.** `min(1, max_concurrent x min(max_position,
+position_size))`. Five positions at 15% is 75%, and no amount of waiting changes that. Four
+remedies, all shipped:
+- `StrategyProfile.max_deployable_pct` exposes the ceiling, so the number that explains the idle
+  cash is visible instead of inferred. Shown on the active-profile card and in the configurator.
+- Defaults raised to 0.15 / 10 positions, matching `app/schemas.py`. The frontend zod schema was
+  at 0.10 / 5 while the API defaulted to 0.15 / 10, so **creating a profile by typing nothing
+  built a profile capped at 50%** - the idle cash, arrived at by omission. The two copies of a
+  schema must match.
+- `allow_fractional_shares` (opt-in, default off) deploys the remainder instead of discarding up
+  to a share per signal. Alpaca accepts fractional quantity on market orders only, so a
+  fractional limit order is refused in `AlpacaClient.submit_order` by name.
+- `cash_sweep` (opt-in, inside `parameters`) buys a broad instrument with a bounded slice of
+  undeployed cash when the strategy finds no signal. Routed through `_process_signal`, so it
+  inherits the same risk checks and the same log write rather than being a second, quieter path
+  to the broker.
+
+`RiskManager.investable_equity` applies `capital_allocation_pct` to **one** base that sizing and
+every risk limit are measured against. Applying it to sizing alone would shrink the positions
+while leaving the limits on the whole account, so a 15% cap would silently become 18.75% of the
+money the operator asked to be investable.
+
+**#6 - "money to invest".** `capital_allocation_pct` on `BotConfig`, defaulted to 1.0. The
+frontend edits it as a percentage and sends a fraction, like every other percentage in the app.
+
+**#1 - no mobile layout.** Below `lg` the sidebar was `-translate-x-full` with nothing to bring
+it back, so the six nav links were unreachable on a phone. `Sidebar` now takes `open`/`onClose`,
+lives in `Layout` beside the header that owns the flag, and dismisses on link tap, backdrop, the
+close button and Escape. Cards go `p-4 sm:p-6`, tables get `overflow-x-auto` with a `min-w`, and
+the dashboard's tab strip scrolls. `App.tsx` no longer mounts a second `<Sidebar/>`.
+
+### Two bugs that only the *next* change exposed
+
+**A schema upgrade that ran in one of two processes.** This project has no Alembic environment,
+so `init_db` is the whole upgrade path - and it was only called from the backend's startup hook.
+The worker is a separate container with its own engine and its own connection pool, so
+deploying `bot_config.capital_allocation_pct` produced exactly the split the migration tests
+were written to rule out: the backend's `/bot/config` served the new field correctly while the
+worker crash-looped on `no such column`, raising inside `BotWorker.start()` before it ever
+scheduled a cycle. `ensure_schema` is not enough on its own; **both processes must run it**,
+and the worker cannot wait its turn - `depends_on: service_started` waits for the container, not
+for the hook, and `docker compose restart worker` starts it with nothing else running. Two
+callers then race on `create_all`, which is a read-then-create with no `IF NOT EXISTS` behind it,
+so `init_db` retries - and only for `already exists`, because a genuine `OperationalError` must
+still surface immediately. See gotcha 19.
+
+**Five percentage fields that were fractions under a `(%)` label.** `Max Position Size (%)`,
+`Max Daily Loss (%)`, `Position Size %` and `Max % of equity per cycle` were all bound to
+`min="0.01" max="1"` - so typing `15` was refused by the input's own `max`, the box displayed
+`0.15` where it said 15%, and a user trying to raise the ceiling for #2 would be fighting the
+form. The new "Money to invest (%)" took 1-100, so two adjacent fields with identical labels
+had opposite scales, which is a worse failure than either being consistently wrong.
+
+The rule this earns: **a percentage input is in the units its label claims, all of them, always,
+and the conversion to the stored fraction happens at exactly one place on the way in and one on
+the way out.** `frac()`/`pct()` in `StrategyPage.tsx` are those two places. The tempting
+alternative - keep the form in fractions and convert per input with react-hook-form's
+`setValueAs` - is wrong, because `form.reset()` bypasses `setValueAs`: the same field would show
+a percent after `handleEdit` and a fraction after `handleStrategyChange`, with no way to tell
+which is which.
 
 **Every one of those eleven was invisible to the test suite.** `worker/scheduler.py` had no
 tests at all, and the strategy tests mocked the Alpaca client to always return bars. Bugs
@@ -166,6 +271,30 @@ error message. This is how the dashboard broke when `MarketClockResponse` omitte
 `'-'` instead of throwing. Apply the same pattern to any new date rendering. Note the backend
 names the order-type field `order_type`, not `type`.
 
+**A date is also a timezone, and there are two ends to get wrong.**
+
+The backend's `datetime.utcnow()` writes **naive UTC**, which round-trips as a string with no
+`Z` and no offset. A browser then reads it as *local* time. On the container's UTC that is
+invisible, and in a UTC browser it is invisible to you as the developer - so this is the class
+of bug that reproduces for the user and not for you. It is what made 15:30 EDT trades display as
+19:30 (gotcha 17).
+
+Fixed at both ends, deliberately:
+
+- **Backend.** `UtcDatetime` in `app/schemas.py` is an `Annotated[datetime, BeforeValidator]`
+  applied to every response timestamp. Naive becomes explicitly-UTC *at the serialization
+  boundary* - one place - instead of in six call sites that each have to remember and each of
+  which fails silently. The API now emits `...Z` and the browser's `new Date()` is correct.
+- **Frontend.** `safeFormat(value, pattern, timeZone?)` in `lib/format.ts` renders in a named
+  zone, using the Intl wall-clock-shift technique: format the parts as if the instant were UTC,
+  then subtract the zone's offset read back off those same shifted parts. Reading the offset
+  back off the parts rather than from `Date.getTimezoneOffset()` is what makes half-hour zones
+  (`Asia/Kolkata`, `Australia/Adelaide`) correct - a fixed 60-minute shift gets them wrong.
+
+The dashboard passes `marketClock.timezone` - the value the worker actually schedules against -
+to every date it draws, and labels the equity chart with it. Same rule as gotcha 16: render what
+the API reports, never hardcode "ET" in the frontend.
+
 **4. `HTTPBearer` returns 403, not 401, when the header is missing entirely.**
 A 403 means "no Authorization header was sent". The axios interceptor in `api/client.ts` only
 handles 401 (expired/invalid token); do not broaden it to 403 or a transient header bug will
@@ -185,6 +314,15 @@ disables it for the worker with `healthcheck: disable: true`.
 coming out of `alpaca_client` that lands in a response dict gets converted explicitly.
 `TradeLog` writes are worse, because the row is already committed by the time anyone
 notices - see gotcha 10.
+
+`Decimal` is in the same list and shows up wherever money comes back from the SDK -
+`filled_avg_price` and `filled_qty` on every order, `cash`/`buying_power` on every account
+snapshot. They bind fine into a SQLite `Float` column, which is what makes them dangerous:
+nothing breaks, and you find out later that your price arithmetic is carrying 28 significant
+digits. `_fill_from_order()` coerces to `float` explicitly and returns `(None, None)` rather
+than `(0.0, 0.0)` for an order with no fill - a zero there is not a missing value, it is a
+report that a fill happened for nothing, and it would also mark the row as reconciled so the
+reconciler would never look at it again.
 
 **13. An agent key is not an admin token. `get_current_principal` is the one gate.**
 `app/authz.py` resolves a bearer token to a `Principal` - either the admin (kind `user`, holds
@@ -267,12 +405,34 @@ wrong again the first time someone sets `BOT_TIMEZONE` to something else. Render
 API reports. The presets are still written as US session times, so the page also warns when the
 configured zone is not `America/New_York`.
 
-**17. `market_hours_only` is stored, displayed, and never read.**
-The worker gates every cycle on Alpaca's market clock unconditionally and never looks at the
-flag, so unchecking "Market Hours Only" does not enable extended hours. The control now says so
-in the UI. **Wiring it up is a trading-path change** - it would let the bot place pre-market and
-after-hours orders - so it needs its own verification against the paper account before anyone
-turns it on. See "Verifying the trading path".
+**17. `market_hours_only` was stored, displayed, and read by nothing - and the reason it
+looked like it worked was a timezone bug.** This is the one to read carefully, because the
+evidence pointed the wrong way twice.
+
+`is_open` alone gates the cycle, so unchecking "Market Hours Only" changed nothing while the
+trades *looked* like they were happening after hours: 19:30-19:50 ET. They were not. Those rows
+were stored as **naive UTC**, which is 15:30-15:50 EDT - the last half hour of the regular
+session. The bot had never traded after hours; the dashboard was rendering UTC in the browser's
+zone and calling it Eastern. So "the flag does nothing" and "the bot trades after hours" were
+both the same timestamp bug, and fixing the display is what made the flag's absence visible.
+
+`app/bot/market_hours.py` now decides properly, and the split of authority is the point:
+
+- **The broker's `is_open` is authoritative** for *whether* trading is possible. It knows about
+  holidays and half-day closes. A wall clock does not, and a bot that derives "it's 9:30 on a
+  Tuesday" from its own clock will happily place an order on Thanksgiving.
+- **The wall clock in `MARKET_TZ` only subdivides** that into pre-market / regular /
+  after-hours, which is what `market_session_state` reports and what the UI labels.
+
+So `trading_allowed()` is false whenever `market_hours_only` is on and the session is not
+regular, and `skip_reason()` returns a sentence saying *which* of the two stopped it - a cycle
+that skips with no explanation is indistinguishable from a cycle that is silently broken.
+`MarketClockResponse` carries `session_state`, `timezone` and `trading_allowed` so the dashboard
+shows the same decision the worker made rather than re-deriving it.
+
+Turning the flag **off** now permits pre-market and after-hours orders, which is the
+consequential direction: thin liquidity, poor fills, and a position that can sit overnight. The
+UI says so on the control rather than presenting it as a neutral preference.
 
 **18. A read that writes will serialise on SQLite, and the rate limiter will not save you.**
 `_authenticate_agent_key` stamps `AgentKey.last_used_at` and commits. That runs on *every*
@@ -309,6 +469,91 @@ SQLAlchemy `commit` event on the engine) rather than assert on `last_used_at`, b
 that only checks the field changed passes against the old code too - the old code changed it on
 every call. And if this ever moves to more than one backend replica, the in-process rate limiter
 needs the same treatment described under "Auditing and rate limiting agent actions".
+
+**19. A migration that runs in one of two processes is a crash loop, not a migration.**
+There is no Alembic environment - `alembic` sits in requirements.txt and nothing imports it - so
+`create_all` + `ensure_schema` is the entire upgrade path. `create_all` creates *tables*, never
+columns, which is what `ensure_schema` is for. It was wired into the backend's startup hook
+only, and the worker - a separate container, its own engine, its own connection pool, sharing
+one SQLite file - never ran it. So deploying `bot_config.capital_allocation_pct` produced a
+backend whose `/bot/config` served the new field correctly and a worker that crash-looped on
+`no such column: bot_config.capital_allocation_pct`, raising inside `BotWorker.start()` before it
+ever scheduled a cycle.
+
+Two things had to be true, and only the first was obvious:
+
+- **Both processes run `init_db()`.** The worker cannot wait for the backend:
+  `depends_on: condition: service_started` waits for the container to spawn, *not* for the
+  startup hook, and `docker compose restart worker` starts the worker with nothing else running
+  at all. Relying on an ordering that `docker compose restart` ignores is relying on nothing.
+- **`init_db()` tolerates losing the race.** Two callers means two processes can reach
+  `create_all` together, and `create_all(checkfirst=True)` is a read-then-create with no
+  `IF NOT EXISTS` behind it. The loser gets `table "x" already exists` and dies on boot, which
+  in practice means the worker crash-looping while the backend finishes starting. Retried - and
+  **only** for that message. A genuine `OperationalError` (corrupt file, read-only mount, full
+  disk) is re-raised immediately, because retrying it turns a clear startup failure into a slow
+  one whose message no longer matches the cause.
+
+Two tests earn their keep here. The upgrade test must build a database in the *old* shape,
+because a fresh `create_all` already has the column and proves nothing - and it must point the
+worker at that file through **both** of its handles, `app.db.get_engine` and the session factory
+imported into `worker.scheduler`. Patching only the second leaves the upgrade running against
+the shared test database, where the column already exists, and the test passes for the wrong
+reason. And every added column carries a `server_default`, because SQLite's `ADD COLUMN` leaves
+existing rows NULL - without one, the feature works on new rows and aborts the cycle on the
+account you already have.
+
+**20. A `TradeLog` row written without its fill is not a data gap, it is a missing feature.**
+`TradeLog.filled_price`/`filled_qty` were NULL on every row in the live database. Capturing the
+fill at submit time covers the order that fills immediately; it does not cover the one that
+fills *after the cycle closes*, which is the common case for anything but a market order, and
+which no cycle will ever look at again because that cycle is over. `_reconcile_fills` runs on a
+1-minute job and re-reads unresolved orders through `AlpacaClient.get_order`.
+
+Three things bound it, all of them load-bearing:
+
+- **Recent only** (`RECONCILE_MAX_AGE_HOURS = 48`). Alpaca's order history is a bounded window,
+  so an unbounded search re-checks rows whose orders expired weeks ago - a permanent 404 on
+  every tick, forever, which fills the log and buries the failures that matter.
+- **Not cancelled, rejected or already-filled rows.** A terminal non-fill will never fill;
+  reconciling it forever is waste, and `filled_price` staying NULL is the correct record of
+  "this never executed".
+- **One commit for the sweep, and one failed order contained.** The SQLite write lock from
+  gotcha 18 is not something to take once per order, and a single 404 must not take the rest of
+  the sweep down. That case is expected rather than exceptional - logged at debug, not error.
+
+Registered **unconditionally**, not under the `is_running` branch: an order placed on the last
+cycle before a stop still fills, and a reconciler gated on "the bot is currently running" would
+miss exactly the orders most likely to still be in flight.
+
+Check what it finds before assuming. All 52 rows here were `submitted` with no fill, which
+reads as "the orders never executed" - and all 52 came back `filled`. They had all executed;
+the app had simply never looked. An unfilled column is evidence of *not knowing*, not of a
+failure.
+
+**21. A percentage input is in the units its label claims. All of them, always.**
+`Max Position Size (%)`, `Max Daily Loss (%)`, `Position Size %` and `Max % of equity per
+cycle` were all bound to `min="0.01" max="1"` - fractions, under percent labels. Typing `15`
+was refused by the input's own `max`, the box displayed `0.15` where it said 15%, and a user
+trying to raise the deployment ceiling would have been fighting the form. Adding a fifth
+percentage field on another page that *did* use 1-100 made it worse: two adjacent inputs with
+identical labels and opposite scales, which is a more confusing failure than either being
+consistently wrong.
+
+The API stores fractions and must keep doing so - every risk limit is a fraction of equity. So
+the conversion is a boundary, and there are exactly two: `frac()` in `onSubmit` on the way out,
+`pct()` in `handleEdit` on the way in.
+
+The tempting alternative is to leave the form in fractions and convert per input with
+react-hook-form's `setValueAs`. **That is wrong**, and quietly: `form.reset()` bypasses
+`setValueAs`, so the same field shows a percent after an edit and a fraction after a strategy
+change, with no way to tell which is which. Keep the form in the units the user sees.
+
+The related trap is a duplicated schema. `app/schemas.py` and the frontend zod schema each carry
+their own defaults, and the zod one won on create - it was at 0.10 position size / 5 positions
+while the API defaulted to 0.15 / 10, so **creating a profile without typing anything built a
+profile structurally capped at 50% of the account**. Two copies of a default is one default too
+many; when you change one, change both.
 
 ## Development Workflow
 - **TDD mandatory:** Write failing tests first, then implementation
@@ -525,6 +770,16 @@ signals. Finally, **read the row back through the ORM** (`row.status`, not raw S
 that succeeds can still have written a value the ORM cannot load, and only a real read catches
 that.
 
+Since issue #3, patching `get_clock` is no longer sufficient on its own - `is_open=True` is now
+necessary but not sufficient, because the cycle also asks `market_session_state` whether the
+session is *regular*. Patch it to a regular-hours clock, or you will be testing a cycle that
+correctly skips and concluding the market-hours gate is broken.
+
+The same applies to `fake_submit_order` now that fills are captured: it must return
+`filled_avg_price` and `filled_qty` as **`Decimal`**, because the real ones are. A stub that
+omits them makes the submit-time capture - and the reconciler - look broken for reasons that are
+an artefact of the stub.
+
 ## Key Technical Decisions
 1. **Single global cron schedule** (not per-profile) - `BOT_SCHEDULE_CRON` in `.env`, evaluated
    in `BOT_TIMEZONE` (Eastern by default)
@@ -561,6 +816,15 @@ never an agent key. The base URL an agent uses is `<origin>/api` - nginx strips 
 | `/bot` | `POST /kill-switch` | `bot:kill` |
 | `/dashboard` | `GET /account`, `/positions`, `/orders`, `/equity-curve`, `/logs`, `/market-clock`, `/audit-log` | `read` |
 | `/health` | `GET /` (container healthcheck) | public |
+
+`GET /bot/config` returns `capital_allocation_pct` (a fraction, 1.0 = all of it) and
+`cron_timezone`. `GET /profiles` returns `max_deployable_pct` per profile -
+`min(1, max_concurrent x min(max_position, position_size))`, the ceiling the worker's own caps
+impose, computed server-side so the frontend cannot disagree with it. `POST /` and `PATCH /{id}`
+reject a profile whose `position_size_pct` exceeds its `risk_max_position_pct` with a 422: the
+strategy would order at a size the risk check then refuses, so every order would fail.
+`GET /dashboard/market-clock` returns `session_state`, `timezone` and `trading_allowed` - the
+worker reads that clock to gate the cycle, so this is its decision, not a second opinion.
 
 There is no agent-facing "place an order" endpoint. The existing action surface is
 start/stop/pause, kill-switch, profile and schedule changes, and reads. Adding direct order

@@ -24,8 +24,9 @@ All services share a SQLite database via a named Docker volume (`bot_data`).
 │  - Setup Page   │  - Auth API     │  - Scheduler                │
 │  - Strategy     │  - Credentials  │  - Config Watcher           │
 │  - Schedule     │  - Profiles     │  - Trading Cycle            │
-│  - Control      │  - Bot Config   │  - Risk Manager             │
-│  - Dashboard    │  - Dashboard    │  - Alpaca Client            │
+│  - Control      │  - Bot Config   │  - Fill Reconciler          │
+│  - Dashboard    │  - Dashboard    │  - Risk Manager             │
+│  - Agents       │                 │  - Alpaca Client            │
 └─────────────────┴─────────────────┴─────────────────────────────┘
            │                │                     │
            └────────────────┴─────────────────────┘
@@ -47,6 +48,19 @@ All services share a SQLite database via a named Docker volume (`bot_data`).
   (`.dark`), exposed to Tailwind as semantic colour names. `darkMode: 'class'`, toggled by a
   class on `<html>`. A blocking script in `index.html` applies the class before first paint to
   avoid a flash. The `dark:` variant is used nowhere - components name a role, not a value.
+- **Responsive layout**: below the `lg` breakpoint the sidebar is an off-canvas drawer owned by
+  `Layout`, dismissed by link tap, backdrop, close button and Escape. Cards step down to `p-4`,
+  wide tables get `overflow-x-auto` with a `min-w` so they scroll inside the page rather than
+  pushing the whole document sideways, and the dashboard's tab strip scrolls with icon-only
+  labels on small screens.
+- **Dates and timezones**: the API emits explicit UTC (`UtcDatetime`, a `BeforeValidator` on every
+  response timestamp) and the dashboard renders through `safeFormat(value, pattern, timeZone?)`
+  in the zone the market-clock response reports. Two rules make this safe: a naive datetime is
+  normalised once at the serialization boundary rather than in each call site, and the frontend
+  never hardcodes "ET" - it renders what the API says, because the worker's zone is configurable.
+- **Percentages**: every percentage input is in the units its label claims (1-100), and converts
+  to the stored fraction at exactly one point on the way in and one on the way out. The API keeps
+  fractions, because every risk limit is a fraction of equity.
 - **API Client**: Axios with JWT interceptor
 - **Build**: Multi-stage Docker build (Node builder → Nginx runtime)
 
@@ -64,12 +78,30 @@ All services share a SQLite database via a named Docker volume (`bot_data`).
 ### Worker
 - **Scheduler**: APScheduler with cron trigger, pinned to `BOT_TIMEZONE` (Eastern by default)
 - **Pattern**: Background scheduler with dynamic job management
-- **Trading Cycle**: Runs on schedule, checks market hours, executes strategies
+- **Trading Cycle**: Runs on schedule, gates on market hours, executes strategies
+- **Market hours**: `app/bot/market_hours.py`. The broker's `is_open` decides *whether* trading is
+  possible (it knows holidays and half-day closes); the wall clock in `MARKET_TZ` only subdivides
+  that into pre-market / regular / after-hours, which is what `market_hours_only` selects on and
+  what `/dashboard/market-clock` reports back.
 - **Async Model**: `BackgroundScheduler` runs jobs in a thread and does not await coroutines, so
   `_run_trading_cycle` is a sync entry point wrapping one `asyncio.run()` around the whole cycle
 - **Risk Management**: Position sizing, daily loss limits, concurrent position limits, kill-switch.
   The daily loss figure comes from the broker (`equity` vs `last_equity`), not from local
   `TradeLog.pnl`, which is never written. Limits gate new buys but never block sells.
+- **Capital base**: `RiskManager.investable_equity` is `equity x capital_allocation_pct`, and it
+  is the base for sizing *and* every risk limit. Applying the allocation to sizing alone would
+  leave the limits measured against the whole account, silently converting a 15% cap into 18.75%
+  of the money the operator asked to be investable.
+- **Deployment ceiling**: `min(1, max_concurrent x min(max_position, position_size))`. Exposed as
+  `StrategyProfile.max_deployable_pct` so the amount of capital the caps make *unreachable* is
+  visible rather than inferred from an idle balance.
+- **Fill reconciler**: a 1-minute job re-reading orders that filled after their cycle closed.
+  Registered unconditionally rather than under `is_running` - an order from the last cycle before
+  a stop still fills, and that is exactly the order a "running" gate would miss. Bounded to the
+  last 48h, since Alpaca's order history is a bounded window and everything older is a permanent
+  404.
+- **Schema**: the worker calls `init_db()` itself. See "Schema management" below - the backend
+  doing it is not enough, because the worker is a separate process on a shared file.
 
 ## Data Flow
 
@@ -77,17 +109,29 @@ All services share a SQLite database via a named Docker volume (`bot_data`).
 ```
 1. Scheduler triggers _run_trading_cycle()
 2. Load active BotConfig and StrategyProfile
-3. Check market clock (skip if closed)
-4. Get account equity from Alpaca
-5. Get current positions from Alpaca
-5. Run strategy.generate_signals() for each symbol
-6. For each signal:
+   (the worker filters on BOTH active_profile_id and enabled - neither alone
+    selects what trades)
+3. Gate on the market clock: skip unless the broker reports the session is open,
+   and - when market_hours_only is set - unless it is the *regular* session
+4. Get account equity and positions from Alpaca
+5. Compute investable_equity = equity x capital_allocation_pct
+6. Run strategy.generate_signals() for each symbol
+7. For each signal:
    a. Validate with RiskManager
    b. Check if position already exists
    c. Submit order via Alpaca API
-   d. Log trade to database
-7. Record equity snapshot
+   d. Record the fill, if the order has one yet
+   e. Log trade to database
+8. If the profile has cash_sweep enabled and the strategy found no signal,
+   spend a bounded slice of undeployed cash on the sweep symbol - through the
+   same _process_signal, so it takes the same risk checks and the same log write
+9. Record equity snapshot
 ```
+
+Steps 3 and 8 are separate gates for a reason. The clock is about *when*; the sweep is about
+*whether there is anything to buy*. Doing the sweep inside the signal loop would have meant a
+second, quieter path to the broker - the exact shape of bug that gotcha 11 describes, where a
+logging failure reads as a trading failure.
 
 ### Configuration Flow
 ```
@@ -172,10 +216,15 @@ stops recording the moment the key is revoked.
 - `api_credentials` - Encrypted Alpaca API keys
 - `agent_keys` - Scoped agent credentials (label, key prefix, key hash, scopes, revoked_at)
 - `audit_log` - State-changing API calls: actor kind/label, key id, method, path, action, status
-- `strategy_profiles` - Strategy configurations with risk params
-- `bot_config` - Global bot settings (schedule, active profile)
-- `trade_logs` - All executed trades with PnL
+- `strategy_profiles` - Strategy configurations with risk params, plus `allow_fractional_shares`
+- `bot_config` - Global bot settings (schedule, active profile, `market_hours_only`,
+  `capital_allocation_pct`)
+- `trade_logs` - All executed trades, with `filled_price`/`filled_qty` once the broker reports them
 - `equity_snapshots` - Periodic equity for curve charting
+
+`cash_sweep` is deliberately *not* a column: it lives inside `strategy_profiles.parameters` as an
+opt-in JSON block, because it is a strategy choice rather than a risk limit, and an operator who
+never wants it should not have a nullable column for it.
 
 ### Key Relationships
 - `BotConfig.active_profile_id` → `StrategyProfile.id` (FK)
@@ -195,6 +244,30 @@ waits rather than raising). WAL is persistent in the file, so it is set once per
 One consequence worth knowing: SQLite serialises writers, so any code path that writes on a read
 request is expensive. `AgentKey.last_used_at` is stamped at most once a minute per key for exactly
 this reason - see `AGENTS.md` gotcha 18.
+
+### Schema management
+There is no Alembic environment - `alembic` is in `requirements.txt` and nothing imports it.
+`app/db.py` provides the whole upgrade path:
+
+1. `Base.metadata.create_all()` - creates missing *tables*
+2. `ensure_schema()` - idempotent `ALTER TABLE ... ADD COLUMN` for columns the models have gained
+
+Step 1 never touches the columns of a table that already exists, which is why step 2 exists:
+adding `bot_config.capital_allocation_pct` as a model change alone produced a backend and a
+worker that both died on their first query with `no such column`, on a database full of real
+trades. Every added column carries a `server_default`, because SQLite's `ADD COLUMN` leaves
+existing rows NULL - without one the feature works on new rows and aborts the cycle on the
+account you already have.
+
+**Both containers call `init_db()`.** The worker is a separate process with its own engine and
+connection pool on the same file, and it cannot wait for the backend: `depends_on:
+service_started` waits for the container, not for the startup hook, and `docker compose restart
+worker` starts it with nothing else running. Two callers then race on `create_all`, which is a
+read-then-create with no `IF NOT EXISTS` behind it, so `init_db()` retries - and only on
+`already exists`, since a genuine `OperationalError` must still surface immediately.
+
+This is deliberately narrow: ADD COLUMN only, no down-migration, no backfill beyond the column's
+default. A rename or a type change needs real Alembic.
 
 ### Column typing at the broker boundary
 `trade_logs.status` and `alpaca_order_id` are free text (`String`), not enums, and the
@@ -266,13 +339,18 @@ docker compose up --build
 
 | Scenario | Mitigation |
 |----------|------------|
-| Market closed | Worker checks clock, skips cycle |
+| Market closed | Worker checks the broker clock, skips cycle; `skip_reason()` says which check stopped it |
+| Pre-market / after-hours with `market_hours_only` on | Broker `is_open` alone permits the session, so the wall clock in `MARKET_TZ` is used to require the *regular* one |
 | API credentials invalid | Test connection endpoint, worker logs error |
 | Daily loss exceeded | Kill-switch triggers, cancels all orders |
 | Position limit reached | RiskManager blocks new buy orders |
 | Database locked | WAL mode + 15s busy timeout, set in `app/db.py` (see below) |
 | Worker crash | APScheduler coalesce=True, max_instances=1 |
 | Config change | Worker polls every 30s, updates schedule dynamically |
+| New column deployed | `init_db()` in *both* containers; the worker crashes on `no such column` otherwise, and only the backend upgrade is not enough |
+| Order fills after its cycle closed | 1-minute fill reconciler re-reads unresolved orders (last 48h) |
+| Order expired from Alpaca's history | Reconciler logs at debug and skips; a permanent 404 is normal operation, not an error |
+| Capital idle because of caps | `max_deployable_pct` shown on the active profile and in the configurator; `capital_allocation_pct` and opt-in fractional/sweep available |
 
 ## Scaling Considerations
 

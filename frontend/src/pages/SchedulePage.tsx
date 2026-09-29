@@ -10,7 +10,15 @@ import { profilesApi, Profile } from '../api/profiles'
 const scheduleSchema = z.object({
   schedule_cron: z.string().min(1, 'Cron expression is required'),
   market_hours_only: z.boolean().default(true),
-  active_profile_id: z.number().nullable().optional()
+  active_profile_id: z.number().nullable().optional(),
+  // 1-100 rather than 0-1, because this field is a percentage and so is every
+  // other one in the app: the Strategy page's Max Position Size, Max Daily
+  // Loss and Position Size are all entered as 15 for fifteen percent. A field
+  // on this page that took a fraction would be the odd one out, and its own
+  // `max` would refuse the number the label invites.
+  // min 1: 0% would mean "never invest", which is the stop button on the
+  // Control page, not an allocation.
+  capital_allocation_pct: z.number().min(1, 'Must be at least 1%').max(100, 'Cannot exceed 100%').default(100)
 })
 
 type ScheduleForm = z.infer<typeof scheduleSchema>
@@ -46,7 +54,11 @@ export function SchedulePage() {
     defaultValues: {
       schedule_cron: '*/5 9-16 * * MON-FRI',
       market_hours_only: true,
-      active_profile_id: null
+      active_profile_id: null,
+      // 100%, not 1.0: the field is a percentage. Seeding it with the
+      // fraction would have shown "0.01" in the box and, if saved, told the
+      // worker to deploy a hundredth of the account.
+      capital_allocation_pct: 100
     }
   })
   
@@ -62,7 +74,15 @@ export function SchedulePage() {
       form.reset({
         schedule_cron: configRes.data.schedule_cron,
         market_hours_only: configRes.data.market_hours_only,
-        active_profile_id: configRes.data.active_profile_id
+        active_profile_id: configRes.data.active_profile_id,
+        // Percent for display; the API stores and returns the fraction.
+        // `!= null` because a response from a backend predating the column has
+        // no value here, and `100 * undefined` is NaN, which renders as an
+        // empty number input rather than as a default.
+        capital_allocation_pct:
+          configRes.data.capital_allocation_pct != null
+            ? configRes.data.capital_allocation_pct * 100
+            : 100
       })
     } catch (err) {
       setError('Failed to load configuration')
@@ -83,7 +103,9 @@ export function SchedulePage() {
       const updateData: BotConfigUpdate = {
         schedule_cron: data.schedule_cron,
         market_hours_only: data.market_hours_only,
-        active_profile_id: data.active_profile_id || null
+        active_profile_id: data.active_profile_id || null,
+        // Percent back to a fraction on the way out.
+        capital_allocation_pct: data.capital_allocation_pct / 100
       }
       
       await botConfigApi.update(updateData)
@@ -136,6 +158,15 @@ export function SchedulePage() {
   
   const currentCronDesc = config ? parseCron(config.schedule_cron) : ''
 
+  // What the *active* profile can deploy, from the server's own figure
+  // (`StrategyProfile.max_deployable_pct`). Null when no profile is active,
+  // where the number would be about nothing.
+  const activeCeiling: number | null = (() => {
+    if (!config?.active_profile_id) return null
+    const p = profiles.find(x => x.id === config.active_profile_id)
+    return p ? p.max_deployable_pct : null
+  })()
+
   // Rendered from the API, not asserted here. This page previously printed
   // "Timezone: UTC" while the worker ran on America/New_York, so a schedule
   // written against the label fired four hours off - the exact bug the
@@ -156,7 +187,7 @@ export function SchedulePage() {
   ]
   
   return (
-    <div className="max-w-2xl mx-auto space-y-6">
+    <div className="max-w-2xl mx-auto space-y-4 sm:space-y-6">
       <div>
         <h1 className="text-2xl font-bold text-body">Schedule & Settings</h1>
         <p className="mt-1 text-sm text-muted">
@@ -197,6 +228,35 @@ export function SchedulePage() {
                   : 'None selected'}
               </dd>
             </div>
+            {/* The allocation in force, and - the point of #2 - what is
+                actually reachable once the active profile's own caps apply.
+                The two numbers together are the honest answer to "why is my
+                cash sitting idle": a 100% allocation under a profile capped
+                at 75% still leaves a quarter uninvested. */}
+            <div>
+              <dt className="text-muted">Money to invest</dt>
+              <dd className="font-medium text-body">
+                {((config.capital_allocation_pct ?? 1) * 100).toFixed(0)}%
+                {activeCeiling !== null && (
+                  <span className="text-muted font-normal">
+                    {' '}&middot; profile can reach{' '}
+                    <span className={
+                      activeCeiling < 0.95 ? 'text-warning-fg font-medium' : 'text-success-fg font-medium'
+                    }>
+                      {(activeCeiling * 100).toFixed(0)}%
+                    </span>
+                  </span>
+                )}
+              </dd>
+              {activeCeiling !== null &&
+                activeCeiling * (config.capital_allocation_pct ?? 1) < 0.95 && (
+                  <dd className="text-muted mt-1 text-xs">
+                    Raise the profile&apos;s Max concurrent / Max position on
+                    the Strategy page - the allocation alone cannot get past
+                    it.
+                  </dd>
+                )}
+            </div>
             <div>
               <dt className="text-muted">Bot Status</dt>
               <dd className="font-medium">
@@ -224,7 +284,7 @@ export function SchedulePage() {
           </div>
         )}
         
-        <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
+        <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4 sm:space-y-6">
           {/* Cron Presets */}
           <div>
             <label className="label">Quick Presets</label>
@@ -243,8 +303,8 @@ export function SchedulePage() {
                         : 'border-line hover:border-line-strong'
                     }`}
                   >
-                    <div className="flex items-center">
-                      <div className={`h-4 w-4 border rounded ${
+                    <div className="flex items-center min-w-0">
+                      <div className={`h-4 w-4 border rounded flex-shrink-0 ${
                         selected
                           ? 'border-accent bg-accent'
                           : 'border-line-strong'
@@ -290,27 +350,35 @@ export function SchedulePage() {
           
           {/* Market Hours Toggle */}
           <div className="border-t border-line pt-6">
-            <div className="flex items-center justify-between">
-              <div>
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
                 <label className="label">Market Hours Only</label>
                 <p className="text-sm text-muted">
                   Restrict the trading cycle to the regular US session
                   (9:30 AM - 4:00 PM ET, Mon-Fri).
                 </p>
-                {/* This toggle is stored and displayed but the worker never
-                    reads it - the cycle gates on Alpaca's market clock
-                    unconditionally. Unchecking it currently does nothing, so
-                    the control says so rather than implying extended-hours
-                    trading is available. */}
+                {/* The cycle now reads this. It was stored, displayed and
+                    consulted by nothing at all, while `is_open` alone let the
+                    bot trade from 04:00 to 20:00 ET - so a position could be
+                    opened at 19:30 and sit overnight with no liquidity behind
+                    it. See app/bot/market_hours.py.
+
+                    Kept as a warning rather than a neutral note, because
+                    turning it *off* is the consequential direction: it permits
+                    orders in pre-market and after-hours, where liquidity is
+                    thin and fills are poor. */}
                 <p className="mt-1 text-xs text-subtle">
-                  Not enforced yet: the cycle always checks the broker's market
-                  clock, so unchecking this does not enable extended hours.
+                  Enforced. When on, a cycle is skipped unless the broker
+                  reports the regular 9:30-16:00 session - which also covers
+                  holidays and half-day closes. Turning it off permits orders
+                  in pre-market and after-hours, where a position may sit
+                  overnight with little liquidity behind it.
                 </p>
               </div>
               <button
                 type="button"
                 onClick={() => form.setValue('market_hours_only', !form.watch('market_hours_only'))}
-                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                className={`relative inline-flex h-6 w-11 flex-shrink-0 items-center rounded-full transition-colors ${
                   form.watch('market_hours_only') ? 'bg-accent' : 'bg-line'
                 }`}
                 role="switch"
@@ -325,10 +393,46 @@ export function SchedulePage() {
             </div>
           </div>
           
+          {/* Capital allocation (issue #6, the "money to invest" control).
+
+              One base, applied before anything else: the strategies size
+              against `equity x this`, and every risk limit is a fraction of
+              the same figure. Applying it to sizing alone would shrink the
+              positions while leaving the limits measured against the whole
+              account, so a 15% cap would quietly become 18.75% of the money
+              the operator asked to be investable. */}
+          <div className="border-t border-line pt-6">
+            <label className="label" htmlFor="capital_allocation_pct">
+              Money to invest (%)
+            </label>
+            <input
+              id="capital_allocation_pct"
+              {...form.register('capital_allocation_pct', { valueAsNumber: true })}
+              type="number"
+              className="input"
+              min="1"
+              max="100"
+              step="1"
+            />
+            <p className="mt-1 text-xs text-muted">
+              Share of account equity the bot is allowed to commit. 100% deploys
+              everything; 80% keeps a 20% cash reserve that no position and no
+              risk limit is measured against. This is a ceiling, not a target -
+              the profile's own caps still bound it (see the Strategy page for
+              what a given profile can actually reach).
+            </p>
+            {form.formState.errors.capital_allocation_pct && (
+              <p className="mt-1 text-sm text-danger-fg">
+                {form.formState.errors.capital_allocation_pct.message}
+              </p>
+            )}
+          </div>
+
           {/* Active Profile */}
           <div className="border-t border-line pt-6">
-            <label className="label">Active Strategy Profile</label>
+            <label className="label" htmlFor="active_profile_id">Active Strategy Profile</label>
             <select
+              id="active_profile_id"
               {...form.register('active_profile_id', { valueAsNumber: true })}
               className="input"
             >
@@ -370,8 +474,8 @@ export function SchedulePage() {
       {/* Cron Help */}
       <div className="card bg-canvas border-line">
         <h3 className="font-medium text-body mb-3">Cron Expression Reference</h3>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm text-left">
+        <div className="overflow-x-auto scrollbar-thin">
+          <table className="w-full min-w-[480px] text-sm text-left">
             <thead>
               <tr className="text-muted border-b border-line">
                 <th className="pb-2 font-medium w-24">Field</th>

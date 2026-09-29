@@ -77,7 +77,7 @@ export function SetupPage() {
   }, [])
   
   return (
-    <div className="max-w-2xl mx-auto space-y-6">
+    <div className="max-w-2xl mx-auto space-y-4 sm:space-y-6">
       <div>
         <h1 className="text-2xl font-bold text-body">Setup</h1>
         <p className="mt-1 text-sm text-muted">
@@ -88,7 +88,7 @@ export function SetupPage() {
       {/* Credentials Status */}
       <div className="card">
         <h2 className="text-lg font-medium text-body mb-4">Connection Status</h2>
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center">
             <div className={`h-3 w-3 rounded-full ${
               hasCredentials ? 'bg-success' : 'bg-line'

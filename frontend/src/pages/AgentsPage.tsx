@@ -48,7 +48,9 @@ function CopyButton({ value, label = 'Copy' }: { value: string; label?: string }
   }
 
   return (
-    <button type="button" onClick={copy} className="btn-secondary py-1.5 px-3 text-xs">
+    // flex-shrink-0 for the same reason as the inputs beside it: in a row with
+    // a w-full input, this is what gets squeezed first.
+    <button type="button" onClick={copy} className="btn-secondary py-1.5 px-3 text-xs flex-shrink-0">
       {copied ? <Check className="h-3.5 w-3.5 mr-1.5" aria-hidden="true" /> : <Copy className="h-3.5 w-3.5 mr-1.5" aria-hidden="true" />}
       {copied ? 'Copied' : label}
     </button>
@@ -106,9 +108,12 @@ function ActivityLog({ revision }: { revision: number }) {
 
   return (
     <section className="card space-y-4">
-      <div className="flex items-center gap-3">
-        <History className="h-5 w-5 text-accent" aria-hidden="true" />
-        <div className="flex-1">
+      <div className="flex items-start gap-3">
+        <History className="h-5 w-5 text-accent mt-0.5 flex-shrink-0" aria-hidden="true" />
+        {/* min-w-0 so the description wraps. A flex child defaults to
+            min-width:auto, which is its content's width - so this block
+            refused to shrink and pushed the refresh button off-screen. */}
+        <div className="min-w-0 flex-1">
           <h2 className="text-lg font-semibold text-body">Recent actions</h2>
           <p className="text-sm text-muted">
             Every state-changing call, whoever made it. Refused attempts are
@@ -174,7 +179,7 @@ function ActivityLog({ revision }: { revision: number }) {
               <div className="min-w-0 flex-1">
                 <p className="text-sm text-body">
                   <span className="font-mono text-xs text-muted">{entry.method}</span>{' '}
-                  <span className="font-mono text-xs">{entry.path}</span>
+                  <span className="font-mono text-xs break-all">{entry.path}</span>
                 </p>
                 {entry.detail && (
                   <p className="text-xs text-subtle font-mono mt-0.5 break-all">
@@ -282,7 +287,7 @@ export function AgentsPage() {
   ${baseUrl}/dashboard/account`
 
   return (
-    <div className="max-w-4xl mx-auto space-y-6">
+    <div className="max-w-4xl mx-auto space-y-4 sm:space-y-6">
       <div>
         <h1 className="text-2xl font-bold text-body">Agents</h1>
         <p className="mt-1 text-sm text-muted">
@@ -311,7 +316,10 @@ export function AgentsPage() {
 
         <div>
           <label className="label" htmlFor="api-base-url">Base URL</label>
-          <div className="flex gap-2">
+          {/* min-w-0 on the row and flex-1 on the input: `.input` is w-full,
+              so inside a flex row it takes its full intrinsic width and
+              squeezes the Copy button instead of the other way round. */}
+          <div className="flex gap-2 min-w-0">
             <input
               id="api-base-url"
               readOnly
@@ -373,8 +381,8 @@ export function AgentsPage() {
               </p>
             </div>
           </div>
-          <div className="flex gap-2">
-            <input readOnly value={revealed.key} onFocus={(e) => e.currentTarget.select()} className="input font-mono text-xs" />
+          <div className="flex gap-2 min-w-0">
+            <input readOnly value={revealed.key} onFocus={(e) => e.currentTarget.select()} className="input font-mono text-xs min-w-0" />
             <CopyButton value={revealed.key} label="Copy key" />
           </div>
           <button type="button" onClick={() => setRevealed(null)} className="btn-secondary py-1.5 px-3 text-xs">
@@ -519,8 +527,8 @@ export function AgentsPage() {
           <h2 className="text-sm font-semibold text-muted uppercase tracking-wide">Revoked</h2>
           <ul className="space-y-2">
             {revoked.map((key) => (
-              <li key={key.id} className="flex items-center justify-between text-sm">
-                <span className="text-subtle line-through">{key.label}</span>
+              <li key={key.id} className="flex flex-wrap items-center justify-between gap-2 text-sm">
+                <span className="text-subtle line-through min-w-0 break-all">{key.label}</span>
                 <span className="text-xs text-subtle">{safeFormat(key.revoked_at, 'MMM d, yyyy')}</span>
               </li>
             ))}

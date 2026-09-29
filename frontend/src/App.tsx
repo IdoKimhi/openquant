@@ -1,7 +1,6 @@
 // Main App component with routing
 import React from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
-import { Sidebar } from './components/Sidebar'
 import { Layout } from './components/Layout'
 import { SetupPage } from './pages/SetupPage'
 import { StrategyPage } from './pages/StrategyPage'
@@ -38,12 +37,12 @@ function App() {
           path="/*"
           element={
             <ProtectedRoute>
-              {/* Sidebar and Layout are siblings. They used to be nested, with
-                  the sidebar passed into Layout as children - which is why
-                  Layout had to render both <Outlet/> and {children}, and the
-                  sidebar ended up mounted twice. */}
+              {/* Layout renders the Sidebar, because on mobile the drawer's
+                  open state is owned by the header button that opens it and
+                  the two have to be the same state. App used to mount the
+                  sidebar as a sibling of Layout and Layout again rendered it
+                  from {children}, which is how it ended up mounted twice. */}
               <div className="min-h-screen bg-canvas">
-                <Sidebar />
                 <Layout />
               </div>
             </ProtectedRoute>

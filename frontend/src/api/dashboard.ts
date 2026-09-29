@@ -65,6 +65,20 @@ export interface MarketClock {
   is_open: boolean
   next_open: string
   next_close: string
+  /**
+   * Which window of the trading day the broker is in: `regular`,
+   * `pre_market`, `after_hours` or `closed` (issue #3).
+   *
+   * `is_open` cannot answer this on its own - Alpaca reports it true from
+   * 04:00 to 20:00 ET - so the dashboard showing "Market: OPEN" during
+   * extended hours is accurate and still misleading, and it was the reason a
+   * correctly-idle bot was indistinguishable from a broken one.
+   */
+  session_state: 'regular' | 'pre_market' | 'after_hours' | 'closed'
+  /** The IANA zone the session is judged in, i.e. the market's. */
+  timezone: string
+  /** Whether the bot would trade right now, given market_hours_only. */
+  trading_allowed: boolean
 }
 
 export const dashboardApi = {

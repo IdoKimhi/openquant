@@ -59,7 +59,7 @@ export function ControlPage() {
   const canKill = config && config.is_running
   
   return (
-    <div className="max-w-2xl mx-auto space-y-6">
+    <div className="max-w-2xl mx-auto space-y-4 sm:space-y-6">
       <div>
         <h1 className="text-2xl font-bold text-body">Bot Control</h1>
         <p className="mt-1 text-sm text-muted">
@@ -81,7 +81,7 @@ export function ControlPage() {
             <div className={`p-4 rounded-lg ${
               config.is_running ? 'bg-success-soft border border-line-success' : 'bg-canvas border border-line'
             }`}>
-              <div className="flex items-center justify-between">
+              <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center">
                   <div className={`h-4 w-4 rounded-full ${
                     config.is_running ? 'bg-success' : 'bg-line'
@@ -243,9 +243,13 @@ export function ControlPage() {
       {/* Kill Switch Confirmation Modal */}
       {showKillConfirm && (
         <div className="fixed inset-0 z-50 overflow-y-auto">
-          <div className="flex min-h-full items-center justify-center p-4">
+          {/* items-start on small screens: `items-center` centres a dialog
+              taller than the viewport, which puts its top and bottom off
+              screen. The kill-switch confirmation is the one modal here whose
+              buttons must never be unreachable. */}
+          <div className="flex min-h-full items-start sm:items-center justify-center p-4">
             <div className="fixed inset-0 bg-subtle bg-opacity-75 transition-opacity" onClick={() => setShowKillConfirm(false)} />
-            <div className="relative bg-surface rounded-lg shadow-xl max-w-md w-full p-6">
+            <div className="relative bg-surface rounded-lg shadow-xl max-w-md w-full p-4 sm:p-6 my-auto">
               <div className="flex items-center justify-center w-12 h-12 mx-auto mb-4 bg-danger-soft rounded-full">
                 <AlertTriangle className="h-7 w-7 text-danger-fg" />
               </div>
@@ -253,17 +257,17 @@ export function ControlPage() {
               <p className="text-sm text-muted text-center mb-6">
                 This will immediately cancel all open orders and close all positions. This action cannot be undone.
               </p>
-              <div className="flex gap-3">
+              <div className="flex flex-wrap gap-3">
                 <button
                   onClick={() => setShowKillConfirm(false)}
-                  className="btn-secondary flex-1"
+                  className="btn-secondary flex-1 min-w-[8rem]"
                 >
                   Cancel
                 </button>
                 <button
                   onClick={() => handleAction('kill')}
                   disabled={actionLoading === 'kill'}
-                  className="btn-danger flex-1"
+                  className="btn-danger flex-1 min-w-[8rem]"
                 >
                   {actionLoading === 'kill' ? (
                     <>
