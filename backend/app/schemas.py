@@ -130,6 +130,12 @@ class CredentialsIn(BaseModel):
     secret_key: str
 
 
+class CredentialsInfo(BaseModel):
+    """Masked credential info for display - never exposes full keys."""
+    key_id_last4: str
+    created_at: UtcDatetime
+
+
 class CredentialsStatus(BaseModel):
     has_keys: bool
     last_tested: Optional[UtcDatetime] = None
@@ -137,9 +143,24 @@ class CredentialsStatus(BaseModel):
 
 class TestConnectionResponse(BaseModel):
     status: str
-    equity: Optional[str] = None
-    buying_power: Optional[str] = None
+    # Numbers, not strings.
+    #
+    # These were declared `str`, and the broker returns a `Decimal`, which
+    # Pydantic rejects for a `str` field - so `POST /credentials/test` raised
+    # ResponseValidationError and 500'd on every real call. The test that should
+    # have caught it mocked `equity` as the string "10000.00", which is the one
+    # thing the SDK never returns (gotcha 5b). The frontend already treated
+    # these as numbers - `Number(result.equity)` - so the type was a lie in both
+    # directions. The route converts explicitly at the boundary.
+    equity: Optional[float] = None
+    buying_power: Optional[float] = None
     account_status: Optional[str] = None
+
+
+class TestCredentialsRequest(BaseModel):
+    """Request to test credentials without storing them."""
+    key_id: str
+    secret_key: str
 
 
 # Strategy Profile Parameters

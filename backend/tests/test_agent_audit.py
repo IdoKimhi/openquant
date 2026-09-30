@@ -14,6 +14,8 @@ materialised dict would pass straight through it.
 
 import json
 from datetime import datetime
+from decimal import Decimal
+from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -232,12 +234,27 @@ class TestRecordedDetail:
         body": a body-capturing audit trail writes the Alpaca secret key to
         disk in plaintext, in a table the `read` scope can read back.
         """
-        resp = client.post(
-            "/credentials",
-            json={"key_id": "PKXXXXXXXXXXXX", "secret_key": "SUPERSECRETVALUE"},
-            headers=admin_headers(),
-        )
-        assert resp.status_code == 200
+        # `POST /credentials` validates with the broker before it writes (issue
+        # #7), so that call has to be faked here too. The account stub carries
+        # the SDK's real types - `equity` is a `Decimal`, never a `str` - for
+        # the reason in gotcha 5b: a convenient stub hides the coercion
+        # boundary, and this very stub is what hid a 500 on
+        # `POST /credentials/test` for a release.
+        with patch("app.routes.credentials.AlpacaClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_account = MagicMock()
+            mock_account.equity = Decimal("10000.00")
+            mock_account.buying_power = Decimal("5000.00")
+            mock_account.status = "ACTIVE"
+            mock_client.get_account = AsyncMock(return_value=mock_account)
+            mock_client_class.return_value = mock_client
+
+            resp = client.post(
+                "/credentials",
+                json={"key_id": "PKXXXXXXXXXXXX", "secret_key": "SUPERSECRETVALUE"},
+                headers=admin_headers(),
+            )
+            assert resp.status_code == 200
 
         rows = audit_rows()
         assert any(r["path"] == "/credentials" for r in rows), "the write itself must be audited"

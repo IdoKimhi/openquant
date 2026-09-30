@@ -259,6 +259,37 @@ implementation rather than the behaviour the worker depends on. Do not add a fea
 trading path without a check that runs against real market data, and do not trust a mock that
 returns convenient types.
 
+## Issues Closed 2026-09-30
+
+**#7 - credential rotation.** `POST /credentials` overwrote the stored key
+unconditionally, and the secret is not recoverable from this app, so a typo
+while rotating destroyed a working configuration with no way back. It now
+validates against the broker *before* the write, and the failure modes are kept
+apart, because the operator's correct response to each is different: 401/403 is
+"go re-copy the key", 429 is "wait", and anything else is "we could not reach
+Alaca" - which is not evidence about the key at all. `_probe` catches
+`APIError` and *not* `Exception`, so a `TypeError` in our own code cannot be
+reported to the operator as "invalid credentials". Also added:
+`DELETE /credentials`, `POST /credentials/test-provided` (validate without
+storing - the non-destructive half that makes the destructive half safe), and
+`GET /credentials` returning the last four of the key id plus the store date,
+which is the only way to tell a rotated key from the one it replaced. 25 tests
+in `test_credentials.py`.
+
+The UI was the bigger half of the gap: the credentials form rendered only
+behind `{!hasCredentials && ...}`, so once a key was saved there was **no way to
+replace it from the browser at all**. The rotation was reachable through the
+API and nowhere else. The form is now always rendered, with a non-destructive
+"Test Without Saving" button and a two-step delete.
+
+**`POST /credentials/test` had been 500ing on every real call.** The response
+model declared `equity`/`buying_power` as `Optional[str]`, and the broker
+returns a `Decimal`, which Pydantic rejects for a `str` field -
+`ResponseValidationError`, HTTP 500. The test that should have caught it mocked
+`equity` as the *string* `"10000.00"`, the one thing the SDK never returns. The
+frontend was papering over it with `Number(result.equity)`, so the type was a
+lie at both ends. See gotcha 22.
+
 ## Gotchas That Have Caused Bugs (API and frontend)
 
 **1. Never put `/api` in a `TestClient` URL.**
@@ -358,7 +389,11 @@ Three things to keep true when you add a route:
   differs.
 - **Credentials and key management are human-only.** `POST /credentials` overwrites the broker
   key, and `POST /agent-keys` mints access. Both use `require_human()`. An agent that can reach
-  either one can escalate itself or take the paper account outright.
+  either one can escalate itself or take the paper account outright. Every route on the
+  `/credentials` router is human-only for this reason, not just the original three - so
+  `DELETE /credentials` and `POST /credentials/test-provided` (issue #7) took `require_human()`
+  too, and `test_credentials.py` checks all five in the negative direction against a key
+  holding `ALL_SCOPES`. A new route here defaults to nothing.
 
 Scopes are `read`, `config:write`, `bot:control`, `bot:kill`. `bot:kill` is never in
 `DEFAULT_SCOPES`, and the `read` default is not a formality - `config:write` alone re-points
@@ -564,6 +599,39 @@ their own defaults, and the zod one won on create - it was at 0.10 position size
 while the API defaulted to 0.15 / 10, so **creating a profile without typing anything built a
 profile structurally capped at 50% of the account**. Two copies of a default is one default too
 many; when you change one, change both.
+
+**22. A response model that lies about a broker type is a 500, and a mock is
+what hides it.**
+
+Gotcha 5b says to coerce SDK types explicitly at the route. This is the other
+half: the coercion is not enough if the *declared* type was wrong to begin with.
+`TestConnectionResponse.equity` was `Optional[str]`, the broker returns a
+`Decimal`, and Pydantic v2 rejects a `Decimal` for a `str` field -
+`ResponseValidationError` -> HTTP 500, on **every** call. Not intermittent, not
+data-dependent: the "Test Connection" button on the setup screen had never
+worked.
+
+The reason it survived is the important part. The test mocked
+`mock_account.equity = "10000.00"` - a `str` - which is the one type the SDK
+never returns. The mock was *more permissive than reality*, so every assertion
+passed and the boundary was never crossed. The frontend did not catch it either
+because it wrote `Number(result.equity)`, which silently absorbs both a string
+and a number: a lie at both ends, each hiding the other.
+
+Two rules that come out of it:
+
+- **Stubs must return the SDK's real types, not convenient ones.** `Decimal` for
+  money, `uuid.UUID` for an order id, an `alpaca.trading.enums` member for a
+  status. This is the same rule as gotcha 5b applied to the test side, and it
+  is the one that actually finds these - a stub that is *more* permissive than
+  the real thing is worse than no stub, because it converts a 500 into a green
+  test.
+- **Check both ends of a boundary, and never let a lenient consumer vouch for a
+  strict producer.** `Number(x)` and `String(x)` will absorb a type error from
+  either side, so agreement between two wrong ends looks like a passing test.
+  Declare the real type on the Pydantic model and the real type in the
+  TypeScript interface, and let the compiler and the serializer be the ones that
+  disagree.
 
 ## Development Workflow
 - **TDD mandatory:** Write failing tests first, then implementation
@@ -821,7 +889,7 @@ never an agent key. The base URL an agent uses is `<origin>/api` - nginx strips 
 | Prefix | Endpoints | Agent scope |
 |--------|-----------|-------------|
 | `/auth` | `POST /login`, `GET /verify` | public (password / bearer) |
-| `/credentials` | `POST /`, `GET /status`, `POST /test` | **human** |
+| `/credentials` | `POST /`, `GET /`, `DELETE /`, `GET /status`, `POST /test`, `POST /test-provided` | **human** |
 | `/agent-keys` | `GET/POST /`, `GET /scopes`, `DELETE /{id}` | **human** |
 | `/profiles` | `GET /`, `GET /{id}` | `read` |
 | `/profiles` | `POST /`, `PATCH/DELETE /{id}`, `POST /{id}/activate` | `config:write` |
