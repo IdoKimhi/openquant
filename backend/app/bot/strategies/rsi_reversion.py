@@ -86,6 +86,13 @@ class RSIReversionStrategy(BaseStrategy):
                         ))
                 elif rsi > overbought:
                     # Overbought - SELL (flatten position)
+                    # The qty below is a *budget* figure, not the position.
+                    # A strategy cannot know the holding size - generate_signals
+                    # is given symbol strings and never sees a position - so it
+                    # sizes the exit the only way it can, and BotWorker clamps it
+                    # to what is actually held before the order is sent. Do not
+                    # read this as the amount that will be sold, and do not try to
+                    # make it correct here: see issue #9 and test_sell_quantity.py.
                     qty = size_qty(budget, current_price, allow_fractional)
                     if qty > 0:
                         signals.append(Signal(

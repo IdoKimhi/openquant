@@ -226,7 +226,7 @@ class TestWorkerWritesALoadableRow:
             asyncio.run(worker._process_signal(
                 signal=signal, profile=profile, alpaca=alpaca,
                 investable_equity=10000.0,
-                current_positions_count=0, current_position_symbols=set(),
+                current_positions_count=0, current_positions={},
                 risk_manager=RiskManager(db), daily_loss_pct=0.0,
             ))
         finally:

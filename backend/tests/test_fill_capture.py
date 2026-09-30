@@ -197,7 +197,7 @@ class TestWorkerCapturesAnImmediateFill:
                               order_type="market", estimated_price=337.0),
                 profile=profile, alpaca=alpaca,
                 investable_equity=10000.0,
-                current_positions_count=0, current_position_symbols=set(),
+                current_positions_count=0, current_positions={},
                 risk_manager=RiskManager(db), daily_loss_pct=0.0,
             ))
             return db.query(TradeLog).all()

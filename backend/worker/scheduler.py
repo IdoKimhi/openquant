@@ -385,8 +385,22 @@ class BotWorker:
             )
 
             # Get current positions from Alpaca
+            #
+            # Symbol -> quantity, not a bare set of symbols. The quantity is not
+            # a nicety: a sell's size *is* the holding (issue #9), and this line
+            # used to throw `p.qty` away one character after fetching it, so
+            # `_process_signal` had no way to size an exit and every strategy
+            # fell back to sizing it like a buy - 22 consecutive broker
+            # rejections against a 1-share position in the live log.
+            #
+            # It is a dict rather than a parallel set + dict deliberately. Two
+            # structures tracking one fact drift the first time a sell is
+            # partial, and "is this symbol held" and "how much of it" have to
+            # answer consistently for the in-cycle bookkeeping to be right.
             positions = await alpaca.get_positions()
-            current_position_symbols = {p.symbol for p in positions}
+            current_positions: dict[str, float] = {
+                p.symbol: float(p.qty) for p in positions
+            }
             current_positions_count = len(positions)
             deployed_value = sum(abs(float(p.market_value)) for p in positions)
 
@@ -413,7 +427,7 @@ class BotWorker:
                         alpaca=alpaca,
                         investable_equity=investable_equity,
                         current_positions_count=current_positions_count,
-                        current_position_symbols=current_position_symbols,
+                        current_positions=current_positions,
                         risk_manager=risk_manager,
                         daily_loss_pct=daily_loss_pct
                     )
@@ -437,13 +451,13 @@ class BotWorker:
                 risk_manager=risk_manager,
                 investable_equity=investable_equity,
                 # This cycle's orders have spent cash the sweep was about to
-                # treat as spare. The count and symbols were already being
+                # treat as spare. The count and quantities were already being
                 # updated in place by _process_signal; the *value* was not,
                 # and it is the value the sweep subtracts - see the returned
                 # notional from _process_signal.
                 deployed_value=deployed_value + placed_value,
                 current_positions_count=current_positions_count,
-                current_position_symbols=current_position_symbols,
+                current_positions=current_positions,
                 daily_loss_pct=daily_loss_pct,
             )
 
@@ -479,7 +493,7 @@ class BotWorker:
         alpaca: AlpacaClient,
         investable_equity: float,
         current_positions_count: int,
-        current_position_symbols: set,
+        current_positions: dict,
         risk_manager: RiskManager,
         daily_loss_pct: float = 0.0
     ):
@@ -505,11 +519,16 @@ class BotWorker:
         cash sweep can still spend; without it the sweep would size itself
         against the book as it was *before* this cycle's orders, and could
         announce an order it then refused.
+
+        `current_positions` is symbol -> quantity and is mutated in place, so it
+        is the cycle's live book rather than a snapshot taken before it. The
+        quantity is load-bearing: it is what a sell is sized against (see the
+        clamp below), and a sell signal's own `qty` is not trusted for that.
         """
         symbol = signal.symbol
         side = signal.side
         qty = signal.qty
-        
+
         # Get current price for risk checks
         current_price = signal.estimated_price
         if current_price <= 0:
@@ -519,8 +538,72 @@ class BotWorker:
                 current_price = quote.ask_price if side == "buy" else quote.bid_price
             except Exception:
                 logger.warning(f"Could not get current price for {signal.symbol}")
-                return
-        
+                # 0.0, not a bare `return`. The cycle does
+                # `placed_value += await self._process_signal(...)`, so a None
+                # here raised TypeError inside the signal loop, which the loop's
+                # `except Exception` swallowed into a "Error processing signal"
+                # log - dropping the signal and skipping the cash sweep for the
+                # cycle, over a quote lookup that failed. The docstring promises
+                # 0.0 for "nothing was placed" and that has to include "could not
+                # even price it".
+                return 0.0
+
+        # A sell's size is the position, not a share of equity.
+        #
+        # Every strategy sizes a sell exactly as it sizes a buy - `qty =
+        # size_qty(budget, price, allow_fractional)`, where budget is
+        # position_size_pct x equity. All three carry a comment saying
+        # "flatten position" and none of them can honour it: `generate_signals`
+        # is handed symbol strings and never learns a holding size, so that
+        # line computes how many shares a *fresh* allocation would buy. The two
+        # numbers are unrelated by construction, and when the fresh allocation
+        # is the larger one the broker refuses the order outright - 22
+        # consecutive `40310000 insufficient qty available` rejections in the
+        # live log, one every half hour, none of which could ever succeed while
+        # the holding stayed put (issue #9).
+        #
+        # Worse, it rots. The budget grows with the account and the holding does
+        # not, so a position bought when equity was lower becomes permanently
+        # un-exitable as the account earns. Three of seven live positions were
+        # already stuck that way, one by 0.02 shares. That defeats the risk
+        # design from outside the risk layer: `validate_order` always permits
+        # sells specifically so a breach can never trap a position.
+        #
+        # The clamp is a ceiling, not a substitution. A signal smaller than the
+        # holding closes that much and leaves the rest standing.
+        #
+        # This runs *before* `validate_order` so the risk layer approves the
+        # quantity that will actually be sent. Handing it a number the broker
+        # was always going to refuse is a check reasoning about a trade that
+        # does not exist.
+        if side == "sell":
+            held = current_positions.get(symbol, 0.0)
+            if held <= 0:
+                logger.info(f"No position in {symbol} to sell, skipping")
+                return 0.0
+
+            qty = min(qty, held)
+
+            # `size_qty` already floors when the profile is whole-share, so
+            # this is normally a no-op - the signal's quantity is whole by then.
+            # It earns its place when a position was opened under fractional
+            # sizing and is being closed after the flag went off, which is
+            # exactly the state COST is in on the live account (1.29 held, 1.31
+            # requested).
+            #
+            # Floored, never rounded up. A sub-share holding becomes 0 shares,
+            # which is not an order, and rounding up instead would be a short
+            # sale this code is not entitled to open. Both are handled below.
+            if not profile.allow_fractional_shares:
+                qty = float(int(qty))
+
+            if qty <= 0:
+                logger.info(
+                    f"Position in {symbol} is {held} shares, which the "
+                    f"whole-share profile cannot sell; skipping"
+                )
+                return 0.0
+
         # Risk validation. The base passed is the *investable* one, so the
         # position cap is measured against allocation x equity, agreeing with
         # what the strategies sized against. Sizes and limits on two different
@@ -534,21 +617,15 @@ class BotWorker:
             side=side,
             daily_loss_pct=daily_loss_pct
         )
-        
+
         if not result.allowed:
             logger.warning(f"Risk check failed for {symbol} {side}: {result.reason}")
             return 0.0
-        
-        # Check if we already have a position in this symbol
-        has_position = symbol in current_position_symbols
-        
-        # For sell signals, only proceed if we have a position to close
-        if side == "sell" and not has_position:
-            logger.info(f"No position in {symbol} to sell, skipping")
-            return 0.0
-        
-        # For buy signals, check if we already have a position (avoid doubling)
-        if side == "buy" and has_position:
+
+        # For buy signals, check if we already have a position (avoid doubling).
+        # The sell half of this check moved above, into the clamp: it needs the
+        # quantity, and a `symbol in <set>` answer cannot supply it.
+        if side == "buy" and symbol in current_positions:
             logger.info(f"Already have position in {symbol}, skipping buy")
             return 0.0
         
@@ -607,13 +684,30 @@ class BotWorker:
             
             logger.info(f"Order placed: {side} {qty} {symbol} (order_id: {order.id})")
             
-            # Update position count for subsequent signals
+            # Update the position book for subsequent signals in this cycle.
+            #
+            # A sell used to be an unconditional `discard`, which is only true
+            # of a *full* close. Nothing in the old code could tell the
+            # difference, because nothing knew the size: a partial sell made
+            # the bot forget a position it still held, and a later signal in
+            # the same cycle was then free to open a second one in that
+            # symbol. The book is read by the very next iteration, so a wrong
+            # answer here is a wrong answer for the rest of the cycle.
+            #
+            # Rounded before comparing rather than tested with an epsilon: a
+            # residue of 1e-16 left over from `held - qty` would keep the symbol
+            # in the book for a position that is gone, and `symbol in
+            # current_positions` would refuse the next buy in that symbol.
             if side == "buy":
                 current_positions_count += 1
-                current_position_symbols.add(symbol)
+                current_positions[symbol] = qty
             elif side == "sell":
-                current_positions_count = max(0, current_positions_count - 1)
-                current_position_symbols.discard(symbol)
+                remaining = round(current_positions.get(symbol, 0.0) - qty, 6)
+                if remaining > 0:
+                    current_positions[symbol] = remaining
+                else:
+                    current_positions_count = max(0, current_positions_count - 1)
+                    current_positions.pop(symbol, None)
 
             # The notional this cycle added to the book, so the cash sweep
             # measures "spare" against the book as it now is, not as it was
@@ -645,7 +739,7 @@ class BotWorker:
         investable_equity: float,
         deployed_value: float,
         current_positions_count: int,
-        current_position_symbols: set,
+        current_positions: dict,
         daily_loss_pct: float,
     ) -> None:
         """Put a bounded slice of idle cash into a broad instrument.
@@ -736,7 +830,7 @@ class BotWorker:
             alpaca=alpaca,
             investable_equity=investable_equity,
             current_positions_count=current_positions_count,
-            current_position_symbols=current_position_symbols,
+            current_positions=current_positions,
             risk_manager=risk_manager,
             daily_loss_pct=daily_loss_pct,
         )

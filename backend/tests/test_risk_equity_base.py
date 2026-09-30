@@ -105,7 +105,7 @@ class TestProcessSignalMeasuresTheCapAgainstInvestableEquity:
                 alpaca=alpaca,
                 investable_equity=80000.0,
                 current_positions_count=1,
-                current_position_symbols=set(),
+                current_positions={},
                 risk_manager=risk,
                 daily_loss_pct=0.0,
             )
@@ -135,7 +135,7 @@ class TestProcessSignalMeasuresTheCapAgainstInvestableEquity:
             alpaca=alpaca,
             investable_equity=80000.0,
             current_positions_count=1,
-            current_position_symbols=set(),
+            current_positions={},
             risk_manager=RiskManager(MagicMock()),
             daily_loss_pct=0.0,
         )
@@ -174,7 +174,7 @@ class TestProcessSignalReportsWhatItPlaced:
             alpaca=alpaca,
             investable_equity=80000.0,
             current_positions_count=1,
-            current_position_symbols=set(),
+            current_positions={},
             risk_manager=RiskManager(MagicMock()),
             daily_loss_pct=0.0,
         )
@@ -205,7 +205,7 @@ class TestProcessSignalReportsWhatItPlaced:
                 
                 investable_equity=80000.0,
                 current_positions_count=1,
-                current_position_symbols=set(),
+                current_positions={},
                 risk_manager=risk,
                 daily_loss_pct=0.0,
             )

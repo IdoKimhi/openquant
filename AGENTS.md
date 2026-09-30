@@ -57,7 +57,7 @@ React/TypeScript/Vite/Tailwind (frontend), and APScheduler (worker).
 │   │       ├── bot_config.py    # prefix /bot
 │   │       ├── dashboard.py     # prefix /dashboard
 │   │       └── agent_keys.py    # prefix /agent-keys    (human only)
-│   ├── tests/                   # 22 files, 328 tests, all passing
+│   ├── tests/                   # 25 files, 398 tests, all passing
 │   └── worker/
 │       ├── main.py              # entrypoint (python -m worker.main)
 │       └── scheduler.py         # BotWorker: APScheduler jobs, trading cycle
@@ -140,6 +140,11 @@ All 19 planned tasks are implemented and verified:
   `capital_allocation_pct` is the "money to invest" base, fractional shares and a cash sweep
   are opt-in, and the defaults deploy more than they used to. See gotcha 21.
 - ✅ Mobile layout. The drawer, the tables, the cards and the tab strip all work at 360px.
+- ✅ A sell is sized by the position, not by the equity budget. All three strategies sized an
+  exit exactly as they sized a buy, so every one of them asked to sell more shares than the
+  account held; the broker refused each one (`40310000 insufficient qty available`), 22 times
+  in a row on the live account, and three of seven positions had become impossible to close.
+  `_process_signal` now clamps a sell to the holding, before risk validation. See gotcha 23.
 
 There is no known failing functionality. Keep this file in sync with reality - it previously
 described finished work as "NOT STARTED", which wasted effort and hid real bugs.
@@ -633,6 +638,76 @@ Two rules that come out of it:
   TypeScript interface, and let the compiler and the serializer be the ones that
   disagree.
 
+**23. A sell's size is the position. Never size it against the equity budget.**
+
+All three strategies computed an exit exactly as they computed an entry, and all three
+carried a comment saying "flatten position" while doing the opposite:
+
+```python
+# app/bot/strategies/rsi_reversion.py:88
+elif rsi > overbought:
+    # Overbought - SELL (flatten position)
+    qty = size_qty(budget, current_price, allow_fractional)   # budget = pct x equity
+```
+
+`budget` is what a *fresh* allocation would buy. Applied to closing an old position it is a
+number with no relationship to the holding, and the broker refuses the order outright -
+`40310000 insufficient qty available`. 22 consecutive rejections on the live account, one per
+half-hour cycle, none of which could ever succeed while the holding stayed put.
+
+**The strategies cannot fix this, and that is the finding.** `generate_signals(symbols, params,
+alpaca)` receives symbol strings and never learns a holding size, so no correct flatten size
+is reachable from inside a strategy. For a sell, the quantity is not a strategy decision at
+all. It belongs in `_process_signal`, which had the `Position` objects and dropped `p.qty` one
+line after fetching them. It is a `dict[str, float]` now, not a set of symbols - one structure
+tracking one fact, because a `set` cannot represent a partial sell and two structures drift the
+first time one occurs.
+
+Four things the fix had to get right, each of which is a way to reintroduce it:
+
+- **The clamp is a ceiling, not a substitution.** `min(qty, held)`. A signal smaller than the
+  holding closes that much and leaves the rest standing; replacing the quantity outright would
+  silently turn a partial exit into a full one.
+- **It runs before `validate_order`, not after.** Handing the risk layer a quantity the broker
+  was always going to refuse is a check reasoning about a trade that does not exist. The
+  position cap is buy-only (key decision 7) so it did not catch this, but any check that *does*
+  read sell quantity would have been reasoning about the same fiction.
+- **Floor for whole-share profiles, never round up.** Flooring a 0.5-share holding gives 0,
+  which is not an order, and is skipped. Rounding up instead is a short sale this code is not
+  entitled to open.
+- **A partial sell must leave the remainder in the book.** The old code was an unconditional
+  `discard`, which is only true of a full close. The book is read by the next signal in the same
+  cycle, so a wrong answer there is wrong for the rest of the cycle - and a subtraction residue
+  of 1e-16 would keep a closed position in the book and refuse the next buy in that symbol.
+
+**Why it surfaced on 2026-09-29 with no code change: it did not.** The bug is as old as the
+strategies. What changed is whether it was masked. With `allow_fractional_shares` off,
+`size_qty` floored to whole shares and a whole-share close of a whole-share position happened
+to fit. The flag went on, the sell turned fractional, the holding stayed whole, and sizing a
+1.00 position from a 12% budget produced 1.62. The first cycle after the switch shows both
+halves in the same minute - COST bought 1.29 (fractional live), META sold 1.62 against a 1.00
+holding (rejected).
+
+So: **a regression test for this must use a fractional holding or a fractional signal.** Whole
+share against whole share passes against the unfixed code, because flooring is exactly what hid
+the bug. `test_a_whole_share_profile_floors_the_sell` initially made that mistake and passed
+pre-fix; it now asks for 5.0 against a 1.29 holding so the clamp has to be the thing doing the
+work.
+
+**It also rots as the account earns.** The budget grows with equity and the holding does not,
+so every position bought when equity was lower becomes permanently un-exitable. Three of seven
+live positions were already stuck, one by 0.02 shares. That defeats the risk design from
+outside the risk layer: `validate_order` deliberately always permits sells so that a breach can
+never trap a position, and this made a trapped position reachable anyway. When sizing anything
+against equity, ask what the number means for a position that is *closing* rather than opening -
+the two have no shared formula.
+
+The invariant worth pinning is not a worked example but the clamp as a choke point:
+`test_no_sell_signal_can_over_sell_the_account` sweeps holdings and requested sizes and asserts
+`sent <= held` for all of them. That holds for a strategy that does not exist yet, which
+removing `qty` from `Signal` would not - a convention in three files is a promise, a property of
+the choke point is a guarantee.
+
 ## Development Workflow
 - **TDD mandatory:** Write failing tests first, then implementation
 - **Run tests:** `cd backend && pytest -v` (needs a host Python with the deps)
@@ -641,6 +716,15 @@ Two rules that come out of it:
 - **Environment:** Copy `.env.example` to `.env`, generate secrets
 
 ### Running the tests inside the container
+**Never run two pytest processes in the same directory at once.** `conftest.py` points every run
+at the same relative file, `sqlite:///./test.db`, and the `recreate_db` autouse fixture drops and
+recreates all tables per test - so a second process does not merely slow the first down, it
+deletes the tables out from under it. The symptom is a scattering of errors and failures partway
+through an otherwise green run, in tests that pass in isolation, and it reads exactly like a real
+regression. It happened here while running the suite in the background and then a single file in
+the foreground; the background run's own output was the tell (`EEFEF` at 18%). If results look
+inexplicable, check for a second pytest before believing them.
+
 `conftest.py` uses the relative SQLite URL `sqlite:///./test.db`, but `/app` is root-owned while
 the container runs as `appuser`, so running pytest from `/app` fails with
 `sqlite3.OperationalError: unable to open database file`. Run from a writable CWD instead:
@@ -810,10 +894,22 @@ a build where every 429 is also a write. Check the write count on the throttled
 path - see gotcha 18.
 
 ## Verifying the trading path
-The trading cycle had never executed. Eleven independent bugs have now been found by actually
+The trading cycle had never executed. Twelve independent bugs have now been found by actually
 running it (four in the cycle itself, then the empty-bars bug, the inert kill-switch, the UTC
 schedule, and the order-status/UUID boundary bugs). All are regression-tested, but the lesson
 stands: unit tests that mock the Alpaca client cannot see any of this.
+
+The twelfth was found by a different route and is worth describing, because it took a week of
+live trading to mature and no amount of mocking would have reached it. **The sell-quantity bug
+(gotcha 23) sat in the code from the first release and produced no error at all** until
+`allow_fractional_shares` was switched on, and then failed 22 cycles in a row. Replaying the
+live profile against real bars was what identified it: `run_strategy` on the real account
+returned `SELL META qty=1.63` while the broker held 1.0, which is not a number anyone would
+have chosen to write a test around. A second pass drove all seven live positions through the
+real `_run_trading_cycle` at the quantity the real strategy computes today, and found three
+that could not be closed - one by 0.02 shares. **The useful move was not the one-position
+reproduction, it was asking the question of every position rather than the one that was
+already shouting.**
 
 To re-verify, drive the real code and let only `submit_order` be stubbed. **The stub must
 return the same types the real one does** - a `uuid.UUID` id and a real
