@@ -30,6 +30,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import requests
 from alpaca.common.exceptions import APIError
+from alpaca.trading.enums import AccountStatus
 from fastapi.testclient import TestClient
 
 from app.authz import ALL_SCOPES, generate_agent_key
@@ -101,11 +102,15 @@ def clear_credentials():
         db.close()
 
 
-def fake_account(equity="25000.00", buying_power="50000.00", status="ACTIVE"):
+def fake_account(equity="25000.00", buying_power="50000.00", status=None):
     """A stand-in for `Account`, with the SDK's real field types.
 
-    `equity`/`buying_power` are `Decimal` on the wire object. Returning a float
-    here would hide whether the route coerces at the boundary.
+    `equity`/`buying_power` are `Decimal` and `status` is an `alpaca` enum
+    member on the real object. Every one of these is stubbed with the type the
+    SDK *actually* returns - a float here, or a plain string for `status`,
+    would hide the conversion boundary rather than exercise it (gotcha 5b, and
+    the lesson in gotcha 22 is that this exact kind of stub is what let a 500
+    through a release).
     """
     class _Account:
         pass
@@ -113,7 +118,7 @@ def fake_account(equity="25000.00", buying_power="50000.00", status="ACTIVE"):
     account = _Account()
     account.equity = Decimal(equity)
     account.buying_power = Decimal(buying_power)
-    account.status = status
+    account.status = AccountStatus.ACTIVE if status is None else status
     return account
 
 
@@ -365,6 +370,29 @@ class TestTestingKeysWithoutCommittingThem:
         # Decimal and the conversion happens at this boundary (gotcha 5b).
         assert body["equity"] == pytest.approx(98765.43)
         assert isinstance(body["equity"], (int, float))
+
+    def test_account_status_is_the_enum_value_not_its_repr(self):
+        """`AccountStatus` is a `str` subclass whose `str()` is `AccountStatus.ACTIVE`.
+
+        Both facts are needed to get this right, and getting it wrong is silent:
+        the response is a valid string, the status code is 200, and the operator
+        reads "Connected to Alpaca! Status: AccountStatus.ACTIVE" on a setup
+        screen. This is the reason the fake above returns the real enum rather
+        than the string "ACTIVE" - a plain string stub cannot see the bug at
+        all, which is the same trap as the `str`/`Decimal` mismatch in
+        `TestConnectionResponse`.
+        """
+        clear_credentials()
+        with broker_patches(AsyncMock(return_value=fake_account())):
+            resp = client.post(
+                "/credentials/test-provided",
+                json={"key_id": "PKCANDIDATE", "secret_key": "candidate-secret"},
+                headers=admin_headers(),
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["account_status"] == "ACTIVE"
+        assert "AccountStatus" not in resp.text
 
 
 class TestDeletingCredentials:

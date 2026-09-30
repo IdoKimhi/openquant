@@ -49,6 +49,23 @@ def _broker_message(exc: APIError) -> str:
     return (message or str(body)).strip()
 
 
+def _enum_value(value):
+    """The plain value behind an SDK enum, or `None` for `None`.
+
+    Alpaca returns status as an enum member. `AccountStatus` subclasses `str`,
+    which is the trap: it *looks* string-like and Pydantic's `str` field accepts
+    it, but `str(member)` is the repr (`"AccountStatus.ACTIVE"`), not the value
+    (`"ACTIVE"`). So the bug is silent - a 200, a valid string, and a setup
+    screen that says "Status: AccountStatus.ACTIVE".
+
+    `.value` is the one thing both enum flavours agree on; anything without it
+    (a bare string, which the test's own fakes use) passes through unchanged.
+    """
+    if value is None:
+        return None
+    return getattr(value, "value", value)
+
+
 async def _probe(client: AlpacaClient) -> dict:
     """Ask the broker who we are, and describe the account if it answers.
 
@@ -88,11 +105,18 @@ async def _probe(client: AlpacaClient) -> dict:
     # belt and braces rather than a fix for a 500. It is here because
     # `equity` is read by the frontend as a number, and the one place that has
     # to be true is where the broker's types are converted (gotcha 5b).
+    #
+    # `status` needs the same treatment for a different reason: `AccountStatus`
+    # subclasses `str`, but `str()` on it yields `"AccountStatus.ACTIVE"` while
+    # `.value` yields `"ACTIVE"`. The response model declares `Optional[str]`,
+    # so the repr sails straight through validation and the operator reads
+    # "Status: AccountStatus.ACTIVE" on the setup screen. Both facts are needed
+    # to fix it and neither is obvious.
     return {
         "status": "connected",
         "equity": float(account.equity) if account.equity is not None else None,
         "buying_power": float(account.buying_power) if account.buying_power is not None else None,
-        "account_status": str(account.status) if account.status is not None else None,
+        "account_status": _enum_value(account.status),
     }
 
 
